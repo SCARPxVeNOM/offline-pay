@@ -10,20 +10,23 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
-        android:label="OfflinePay Wallet"
-        android:icon="@android:drawable/ic_menu_send"
-        android:theme="@style/Theme.Material3.DayNight.NoActionBar"
+        android:label="OFFPAY"
+        android:icon="@drawable/offpay_logo"
+        android:roundIcon="@drawable/offpay_logo"
+        android:theme="@style/Theme.Offpay"
         android:allowBackup="false"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true">
 
-        <activity android:name=".HomeActivity" android:exported="true">
+        <activity android:name=".SplashActivity" android:exported="true"
+            android:theme="@style/Theme.Offpay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
+        <activity android:name=".HomeActivity"     android:exported="false" />
         <activity android:name=".SendActivity"     android:exported="false" />
         <activity android:name=".ReceiveActivity"  android:exported="false" />
         <activity android:name=".TopupActivity"    android:exported="false" />

@@ -260,6 +260,54 @@ app.post("/api/wallet/topup", async (req, res) => {
   }
 });
 
+// ─── Option B: prep a wallet for self-custody ─────────────────────────────
+// Sender (or first-time receiver) calls /api/wallet/init { address, amountUsdc }
+// once when they have internet. Backend:
+//   - gas-funds the wallet with 0.05 MATIC if balance < 0.02 MATIC
+//   - mints `amountUsdc` of MockUSDC into the wallet (default $5)
+// User wallet then signs its own approve + lockFunds locally to put USDC
+// in the vault under its own payer slot. Tap-time signing happens with
+// the user's key. Receiver settles on-chain itself (also from its own
+// wallet) so the on-chain story is sender-wallet → receiver-wallet
+// directly — fully visible in the explorer's tx history of either side.
+app.post("/api/wallet/init", async (req, res) => {
+  if (!usdc) return res.status(503).json({ error: "chain not configured" });
+  try {
+    const { address, amountUsdc } = req.body || {};
+    if (!ethers.isAddress(address)) return res.status(400).json({ error: "bad address" });
+    // 0 amount = gas-only top-up (used by the receiver before its first
+    // on-chain settle). Otherwise mints requested mUSDC into the wallet.
+    const amt = amountUsdc != null ? BigInt(amountUsdc) : 5_000_000n;
+    if (amt < 0n || amt > 100_000_000n) return res.status(400).json({ error: "amount out of range" });
+
+    const result = await withChainLock(async () => {
+      const txs = {};
+      // Amoy gas can spike; one settleBearerBatch costs ~0.06 MATIC, and a
+      // topup runs three txs (~0.18). Keep a high floor + generous top-up so
+      // a single mid-flow gas spike doesn't cause "insufficient funds".
+      const gasFloor = ethers.parseEther("0.10");
+      const gasTopup = ethers.parseEther("0.20");
+      const balance  = await provider.getBalance(address);
+      if (balance < gasFloor) {
+        const need = gasTopup - balance;
+        const t = await signer.sendTransaction({ to: address, value: need });
+        txs.gas = (await t.wait()).hash;
+      }
+      if (amt > 0n) {
+        const t2 = await usdc.mint(address, amt);
+        txs.mint = (await t2.wait()).hash;
+      }
+      return txs;
+    });
+
+    res.json({ ok: true, address: address.toLowerCase(),
+               amountUsdc: amt.toString(), txs: result });
+  } catch (e) {
+    console.error("/api/wallet/init", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Receiver pushes received vouchers; backend settles on-chain to recipient ───
 // Body: { recipient, vouchers: [{ voucher, signature }] }
 // Response: { ok, settled: N, tx: '0x…', rejected: [{voucherId, reason}] }

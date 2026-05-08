@@ -8,81 +8,104 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
 import android.util.Log
-import android.widget.*
-import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
+import com.offlinepay.wallet.ui.DashState
+import com.offlinepay.wallet.ui.DashboardScreen
+import com.offlinepay.wallet.ui.OffpayTheme
+import com.offlinepay.wallet.ui.RecentRow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import java.math.BigInteger
 
-// Process-scoped: auto-settle must outlive the activity if user navigates
-// during the redeem call.
 private val homeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-class HomeActivity : AppCompatActivity() {
+class HomeActivity : ComponentActivity() {
     private lateinit var keyVault: KeyVault
-    private lateinit var unspent: UnspentStore
     private lateinit var received: VoucherStore
     private lateinit var backend: BackendClient
-    private lateinit var addrView: TextView
-    private lateinit var balView: TextView
-    private lateinit var settleStatus: TextView
+    private lateinit var settle: SettlementClient
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    private val state = MutableStateFlow(DashState())
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         keyVault = KeyVault(this)
-        unspent  = UnspentStore(this)
         received = VoucherStore(this)
         backend  = BackendClient(Config.BACKEND_BASE)
+        settle   = SettlementClient(
+            rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
+            chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
+            fromAddress = keyVault.address
+        )
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 96, 48, 48)
+        state.value = state.value.copy(walletAddress = keyVault.address)
+
+        setContent {
+            OffpayTheme {
+                val s by state.collectAsState()
+                DashboardScreen(
+                    state = s,
+                    onSend     = { startActivity(Intent(this, SendActivity::class.java)) },
+                    onReceive  = { startActivity(Intent(this, ReceiveActivity::class.java)) },
+                    onTopup    = { startActivity(Intent(this, TopupActivity::class.java)) },
+                    onHistory  = { startActivity(Intent(this, HistoryActivity::class.java)) },
+                    onBackup   = { startActivity(Intent(this, BackupRestoreActivity::class.java)) },
+                    onSettleNow= { homeScope.launch { autoSettle() } },
+                )
+            }
         }
-        addrView = TextView(this).apply { textSize = 12f; typeface = android.graphics.Typeface.MONOSPACE }
-        balView  = TextView(this).apply { textSize = 14f }
-        settleStatus = TextView(this).apply { textSize = 12f; setTextColor(0xFF6E7280.toInt()) }
-        val sendBtn    = Button(this).apply { text = "Send" }
-        val recvBtn    = Button(this).apply { text = "Receive" }
-        val topupBtn   = Button(this).apply { text = "Top up" }
-        val historyBtn = Button(this).apply { text = "History" }
-        val backupBtn  = Button(this).apply { text = "Backup / restore wallet" }
 
-        listOf(addrView, balView, settleStatus, sendBtn, recvBtn, topupBtn, historyBtn, backupBtn)
-            .forEach { root.addView(it) }
-        setContentView(root)
-
-        addrView.text = "wallet: ${keyVault.address}"
-
-        sendBtn.setOnClickListener    { startActivity(Intent(this, SendActivity::class.java)) }
-        recvBtn.setOnClickListener    { startActivity(Intent(this, ReceiveActivity::class.java)) }
-        topupBtn.setOnClickListener   { startActivity(Intent(this, TopupActivity::class.java)) }
-        historyBtn.setOnClickListener { startActivity(Intent(this, HistoryActivity::class.java)) }
-        backupBtn.setOnClickListener  { startActivity(Intent(this, BackupRestoreActivity::class.java)) }
-
-        // Live local-wallet state. No chain RPC.
+        // Live recent activity from local store.
         lifecycleScope.launch {
-            unspent.unspentTotalFlow().combine(received.recent()) { totalBase, rows ->
-                val unspentUsdc = "%.2f".format(totalBase.toDouble() / 1e6)
-                val pending = rows.count { it.status == "accepted" }
+            received.recent().collect { rows ->
+                val mapped = rows.take(5).map { r ->
+                    val amt = "%.2f".format(BigInteger(r.amount).toDouble() / 1e6)
+                    when (r.status) {
+                        "settled"  -> RecentRow("On-chain settle", "INCOMING · ${r.voucherId.take(10)}…", "+ \$$amt", true)
+                        "accepted" -> RecentRow("Voucher received", "PENDING SETTLE · NFC", "+ \$$amt", true)
+                        else       -> RecentRow("Rejected voucher", "ERROR · ${r.rejectReason ?: ""}", "  \$$amt", false)
+                    }
+                }
+                val pendingCount = rows.count { it.status == "accepted" }
                 val pendingTotal = "%.2f".format(
                     rows.filter { it.status == "accepted" }
                         .sumOf { BigInteger(it.amount) }.toDouble() / 1e6
                 )
-                "spendable: $unspentUsdc USDC\nincoming pending settle: $pending vouchers ($pendingTotal USDC)"
-            }.collectLatest { balView.text = it }
+                state.value = state.value.copy(
+                    recent = mapped,
+                    pendingCount = pendingCount,
+                    pendingUsdc = pendingTotal,
+                )
+            }
         }
     }
 
     override fun onResume() {
         super.onResume()
         registerNetCallback()
-        if (isOnline()) homeScope.launch { autoSettle() }
+        if (isOnline()) {
+            homeScope.launch {
+                runCatching {
+                    val locked = settle.lockedBalance(keyVault.address)
+                    val str = "%.2f".format(locked.toDouble() / 1e6)
+                    state.value = state.value.copy(lockedUsdc = str, syncedSecondsAgo = 0)
+                }
+                autoSettle()
+            }
+        } else {
+            state.value = state.value.copy(syncedSecondsAgo = null)
+        }
     }
 
     override fun onPause() {
@@ -93,33 +116,32 @@ class HomeActivity : AppCompatActivity() {
     private suspend fun autoSettle() {
         val pending = received.pendingForSettle()
         if (pending.isEmpty()) return
-        runOnUiThread { settleStatus.text = "settling ${pending.size} pending voucher(s)…" }
+        state.value = state.value.copy(settleStatus = "settling ${pending.size} voucher(s)…")
         try {
-            val items = pending.map {
-                BackendClient.RedeemItem(
-                    voucher = BackendClient.VoucherFields(
-                        payer = it.payer, merchant = it.merchant,
-                        amount = it.amount, expiry = it.expiry,
-                        nonce = it.nonce, voucherId = it.voucherId
-                    ),
-                    signature = it.signature
-                )
+            runCatching { backend.init(keyVault.address, 0L) }
+            val tx = try {
+                settle.settleBearerBatch(pending, keyVault.address)
+            } catch (t: Throwable) {
+                Log.w(TAG, "direct settle failed, fallback relay: ${t.message}")
+                val items = pending.map {
+                    BackendClient.RedeemItem(
+                        voucher = BackendClient.VoucherFields(
+                            payer = it.payer, merchant = it.merchant,
+                            amount = it.amount, expiry = it.expiry,
+                            nonce = it.nonce, voucherId = it.voucherId
+                        ),
+                        signature = it.signature
+                    )
+                }
+                val resp = backend.redeem(keyVault.address, items)
+                if (!resp.ok) error(resp.error ?: "relay failed")
+                resp.tx ?: error("relay returned no tx")
             }
-            val resp = backend.redeem(keyVault.address, items)
-            if (!resp.ok) {
-                runOnUiThread { settleStatus.text = "settle failed: ${resp.error ?: "unknown"}" }
-                return
-            }
-            val tx = resp.tx ?: ""
-            val rejectedIds = resp.rejected.map { it.voucherId }.toSet()
-            pending.filter { it.voucherId !in rejectedIds }
-                .forEach { received.markSettled(it.voucherId, tx) }
-            runOnUiThread {
-                settleStatus.text = "⛓ settled ${resp.settled} — tx ${tx.take(10)}…"
-            }
+            pending.forEach { received.markSettled(it.voucherId, tx) }
+            state.value = state.value.copy(settleStatus = "⛓ settled ${pending.size} — tx ${tx.take(10)}…")
         } catch (t: Throwable) {
             Log.e(TAG, "settle failed", t)
-            runOnUiThread { settleStatus.text = "settle failed: ${t.message}" }
+            state.value = state.value.copy(settleStatus = "settle failed: ${t.message}")
         }
     }
 
@@ -127,8 +149,7 @@ class HomeActivity : AppCompatActivity() {
         if (netCallback != null) return
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val req = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.d(TAG, "network available -> auto-settle")

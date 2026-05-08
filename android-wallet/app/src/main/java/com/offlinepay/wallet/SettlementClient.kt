@@ -74,6 +74,52 @@ class SettlementClient(
         send.transactionHash
     }
 
+    /// Bearer settle: receiver phone is msg.sender. Skips per-payer nonce
+    /// check; voucherId uniqueness is the sole replay guard. Funds go to
+    /// `recipient` (caller specifies — typically the receiver's own address).
+    suspend fun settleBearerBatch(rows: List<VoucherRow>, recipient: String): String =
+        withContext(Dispatchers.IO) {
+            require(rows.isNotEmpty()) { "no vouchers to settle" }
+
+            val voucherTuples = rows.map { r ->
+                DynamicStruct(
+                    Address(r.payer),
+                    Address(r.merchant),
+                    Uint256(BigInteger(r.amount)),
+                    Uint256(BigInteger.valueOf(r.expiry)),
+                    Uint256(BigInteger.valueOf(r.nonce)),
+                    Bytes32(Numeric.hexStringToByteArray(r.voucherId))
+                )
+            }
+            val sigs = rows.map { r -> DynamicBytes(Numeric.hexStringToByteArray(r.signature)) }
+
+            val function = Function(
+                "settleBearerBatch",
+                listOf(
+                    @Suppress("UNCHECKED_CAST")
+                    DynamicArray(DynamicStruct::class.java, voucherTuples) as Type<*>,
+                    DynamicArray(DynamicBytes::class.java, sigs) as Type<*>,
+                    Address(recipient) as Type<*>
+                ),
+                emptyList()
+            )
+            val data = FunctionEncoder.encode(function)
+            val nonce = web3.ethGetTransactionCount(
+                fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING
+            ).send().transactionCount
+            val gasPrice = web3.ethGasPrice().send().gasPrice
+            val gasLimit = BigInteger.valueOf(500_000L * rows.size + 200_000L)
+            val tx = RawTransaction.createTransaction(
+                nonce, gasPrice, gasLimit, vaultAddress, BigInteger.ZERO, data
+            )
+            val signed = TransactionEncoder.signMessage(
+                tx, chainId, org.web3j.crypto.Credentials.create(keyPair)
+            )
+            val resp = web3.ethSendRawTransaction(Numeric.toHexString(signed)).send()
+            if (resp.hasError()) error("submit failed: ${resp.error.message}")
+            resp.transactionHash
+        }
+
     suspend fun maticBalance(addr: String): BigInteger = withContext(Dispatchers.IO) {
         web3.ethGetBalance(addr, org.web3j.protocol.core.DefaultBlockParameterName.LATEST).send().balance
     }

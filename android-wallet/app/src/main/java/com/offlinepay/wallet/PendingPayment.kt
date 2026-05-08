@@ -2,54 +2,55 @@ package com.offlinepay.wallet
 
 import android.content.Context
 import android.util.Log
+import java.math.BigInteger
 
-/// Holds the pre-staged tap payload between the Send screen and the HCE
-/// service. Persisted to SharedPreferences (sync commit) so a process death
-/// between Arm and the NFC tap doesn't lose state — Android freely kills
-/// processes, including ours, between activity pause and HCE wakeup.
+/// Holds the next outgoing payment between Send screen and HCE service.
+/// Persisted to SharedPreferences (sync commit) so a process death
+/// between Arm and the NFC tap doesn't lose the pending state.
 ///
-/// Flow:
-///   SendActivity picks 1+ unspent vouchers, calls [arm] with the JSON-array
-///   wire payload + the list of voucherIds those bytes correspond to.
-///   HCE 0xC1 calls [consume] once, returning the bytes; receiver then
-///   stores them, and the sender separately marks those voucherIds as spent
-///   on its UnspentStore.
+/// Option B mode: stores amount + expiry only. HCE signs the voucher at
+/// tap time using NonceTracker + KeyVault, with merchant = receiver
+/// address taken from the INS 0xC1 APDU.
 object PendingPayment {
 
-    data class Armed(val payload: String, val voucherIds: List<String>)
+    data class Armed(val amountUsdc: BigInteger, val expiry: Long)
+
+    data class Outgoing(val voucherId: String, val recipient: String, val amount: BigInteger)
 
     private const val PREFS = "offlinepay_pending"
-    private const val KEY_PAYLOAD = "payload"
-    private const val KEY_IDS = "voucher_ids"
+    private const val KEY_AMT = "amount"
+    private const val KEY_EXP = "expiry"
     private const val KEY_ERR = "last_error"
+    private const val KEY_OUT = "last_outgoing"
     private const val TAG = "OfflinePay/Pending"
 
     private fun prefs(ctx: Context) =
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    fun arm(ctx: Context, payload: String, voucherIds: List<String>) {
+    fun arm(ctx: Context, amountUsdc: BigInteger, ttlSeconds: Long = Config.DEFAULT_TTL_SECONDS) {
+        val expiry = System.currentTimeMillis() / 1000 + ttlSeconds
         prefs(ctx).edit()
-            .putString(KEY_PAYLOAD, payload)
-            .putString(KEY_IDS, voucherIds.joinToString(","))
+            .putString(KEY_AMT, amountUsdc.toString())
+            .putLong(KEY_EXP, expiry)
             .remove(KEY_ERR)
             .commit()
-        Log.d(TAG, "armed payloadLen=${payload.length} ids=$voucherIds")
+        Log.d(TAG, "armed amount=$amountUsdc expiry=$expiry")
     }
 
     fun consume(ctx: Context): Armed? {
         val p = prefs(ctx)
-        val payload = p.getString(KEY_PAYLOAD, null) ?: return null
-        val ids = p.getString(KEY_IDS, "")?.split(",")?.filter { it.isNotEmpty() } ?: emptyList()
-        p.edit().remove(KEY_PAYLOAD).remove(KEY_IDS).commit()
-        Log.d(TAG, "consumed payloadLen=${payload.length} ids=$ids")
-        return Armed(payload, ids)
+        val amt = p.getString(KEY_AMT, null) ?: return null
+        val exp = p.getLong(KEY_EXP, 0L)
+        p.edit().remove(KEY_AMT).remove(KEY_EXP).commit()
+        Log.d(TAG, "consumed amount=$amt expiry=$exp")
+        return Armed(BigInteger(amt), exp)
     }
 
     fun cancel(ctx: Context) {
-        prefs(ctx).edit().remove(KEY_PAYLOAD).remove(KEY_IDS).commit()
+        prefs(ctx).edit().remove(KEY_AMT).remove(KEY_EXP).commit()
     }
 
-    fun isArmed(ctx: Context): Boolean = prefs(ctx).contains(KEY_PAYLOAD)
+    fun isArmed(ctx: Context): Boolean = prefs(ctx).contains(KEY_AMT)
 
     fun reportError(ctx: Context, msg: String) {
         prefs(ctx).edit().putString(KEY_ERR, msg).commit()
@@ -61,16 +62,20 @@ object PendingPayment {
         return s
     }
 
-    /// Set by HceVoucherService after a successful tap so the SendActivity
-    /// can mark the corresponding UnspentRows as spent on its next poll.
-    fun reportSpent(ctx: Context, ids: List<String>) {
-        if (ids.isEmpty()) return
-        prefs(ctx).edit().putString("spent", ids.joinToString(",")).commit()
+    /// Recorded by HCE on a successful tap so SendActivity can show the
+    /// outgoing details (and a sender-side settle worker could later push
+    /// to the chain to mark the funds as transferred from sender's view).
+    fun reportOutgoing(ctx: Context, voucherId: String, recipient: String, amount: BigInteger) {
+        prefs(ctx).edit()
+            .putString(KEY_OUT, "$voucherId|$recipient|$amount")
+            .commit()
     }
-    fun pollSpent(ctx: Context): List<String> {
+    fun pollOutgoing(ctx: Context): Outgoing? {
         val p = prefs(ctx)
-        val s = p.getString("spent", null) ?: return emptyList()
-        p.edit().remove("spent").commit()
-        return s.split(",").filter { it.isNotEmpty() }
+        val s = p.getString(KEY_OUT, null) ?: return null
+        p.edit().remove(KEY_OUT).commit()
+        val parts = s.split("|")
+        if (parts.size != 3) return null
+        return Outgoing(parts[0], parts[1], BigInteger(parts[2]))
     }
 }

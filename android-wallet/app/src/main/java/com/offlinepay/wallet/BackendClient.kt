@@ -26,6 +26,14 @@ class BackendClient(private val baseUrl: String) {
         .build()
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
+    @Serializable data class InitReq(val address: String, val amountUsdc: String)
+    @Serializable data class InitResp(
+        val ok: Boolean = false,
+        val address: String? = null,
+        val amountUsdc: String? = null,
+        val error: String? = null,
+    )
+
     @Serializable data class TopupReq(
         val address: String,
         val amountUsdc: String,
@@ -59,6 +67,21 @@ class BackendClient(private val baseUrl: String) {
         val rejected: List<Reject> = emptyList(),
         val error: String? = null,
     )
+
+    suspend fun init(address: String, amountBaseUnits: Long): InitResp =
+        withContext(Dispatchers.IO) {
+            val body = json.encodeToString(
+                InitReq.serializer(),
+                InitReq(address, amountBaseUnits.toString())
+            )
+            val r = http.newCall(
+                Request.Builder().url("$baseUrl/api/wallet/init")
+                    .post(body.toRequestBody("application/json".toMediaType())).build()
+            ).execute()
+            val text = r.body?.string() ?: "{}"
+            r.close()
+            json.decodeFromString(InitResp.serializer(), text)
+        }
 
     suspend fun topup(address: String, amountBaseUnits: Long, denomBaseUnits: Long, count: Int): TopupResp =
         withContext(Dispatchers.IO) {

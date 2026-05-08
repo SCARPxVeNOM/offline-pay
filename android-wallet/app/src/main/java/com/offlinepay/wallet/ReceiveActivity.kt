@@ -10,115 +10,117 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
 import android.util.Log
-import android.widget.*
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
+import com.offlinepay.wallet.ui.OffpayTheme
+import com.offlinepay.wallet.ui.ReceiveScreen
+import com.offlinepay.wallet.ui.ReceiveState
+import com.offlinepay.wallet.ui.RecentRow
+import com.offlinepay.wallet.ui.StatusKind
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import java.math.BigInteger
 
-// Process-scoped: outlives ReceiveActivity. Critical for the receive path —
-// Room writes must finish even if the user backs out or screen-off pauses
-// the activity before the suspend `saveAccepted` completes.
 private val walletScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-class ReceiveActivity : AppCompatActivity() {
+class ReceiveActivity : ComponentActivity() {
     private lateinit var keyVault: KeyVault
     private lateinit var store: VoucherStore
     private lateinit var verifier: VoucherVerifier
     private lateinit var backend: BackendClient
+    private lateinit var settle: SettlementClient
     private lateinit var reader: ReaderModeLoop
-    private lateinit var status: TextView
-    private lateinit var feed: TextView
-    private lateinit var addrQr: ImageView
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    private val state = MutableStateFlow(
+        ReceiveState(walletAddress = "", status = "scanning… tap a sender phone to your back")
+    )
+
+    private val launcher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        if (res.resultCode == RESULT_OK) {
+            val qr = res.data?.getStringExtra("qr") ?: return@registerForActivityResult
+            walletScope.launch { handleIncoming(qr); if (isOnline()) tryAutoSettle() }
+        }
+    }
+    private val camPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) launcher.launch(Intent(this, QrScanActivity::class.java))
+        else state.value = state.value.copy(status = "camera permission denied", statusKind = StatusKind.Error)
+    }
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         keyVault = KeyVault(this)
         store    = VoucherStore(this)
-        // Bearer-only flow: vouchers carry merchant=0x0, so any receiver
-        // can claim. WRONG_RECIPIENT check is therefore disabled here.
         verifier = VoucherVerifier(
             Config.CHAIN_ID, Config.VAULT_ADDRESS, Config.MAX_SINGLE_USDC,
             store, expectedRecipient = "0x0000000000000000000000000000000000000000"
         )
         backend = BackendClient(Config.BACKEND_BASE)
-
-        val inner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
-        val root = ScrollView(this).apply { addView(inner) }
-        val addrView = TextView(this).apply {
-            text = "your address (also QR for sender to scan):\n${keyVault.address}"
-            textSize = 12f; typeface = android.graphics.Typeface.MONOSPACE
-        }
-        addrQr = ImageView(this).apply {
-            // Cap QR size so the buttons below stay on screen.
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, 480
-            )
-        }
-        status = TextView(this).apply {
-            text = "scanning… tap a sender phone to your back"; textSize = 14f
-        }
-        feed   = TextView(this).apply { textSize = 12f; typeface = android.graphics.Typeface.MONOSPACE }
-        val settleBtn = Button(this).apply { text = "Settle now (online)" }
-        val scanBtn = Button(this).apply { text = "Scan voucher QR" }
-
-        listOf(addrView, status, settleBtn, scanBtn, addrQr, feed).forEach { inner.addView(it) }
-        setContentView(root)
-
-        addrQr.setImageBitmap(Qr.render(keyVault.address))
-
-        val launcher = registerForActivityResult(
-            ActivityResultContracts.StartActivityForResult()
-        ) { res ->
-            if (res.resultCode == RESULT_OK) {
-                val qr = res.data?.getStringExtra("qr") ?: return@registerForActivityResult
-                walletScope.launch { handleIncoming(qr); if (isOnline()) tryAutoSettle() }
-            }
-        }
-        val camPermLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted ->
-            if (granted) launcher.launch(Intent(this, QrScanActivity::class.java))
-            else runOnUiThread { status.text = "✗ camera permission denied" }
-        }
-        scanBtn.setOnClickListener {
-            val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
-                PackageManager.PERMISSION_GRANTED
-            if (granted) launcher.launch(Intent(this, QrScanActivity::class.java))
-            else camPermLauncher.launch(Manifest.permission.CAMERA)
-        }
+        settle  = SettlementClient(
+            rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
+            chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
+            fromAddress = keyVault.address
+        )
+        state.value = state.value.copy(walletAddress = keyVault.address)
 
         reader = ReaderModeLoop(
             this,
             ourAddressHex = keyVault.address,
             onVoucher = { json ->
-                // Save on the process-scoped IO scope so it completes even if
-                // the activity gets paused/destroyed during the suspend insert.
                 walletScope.launch {
                     handleIncoming(json)
                     if (isOnline()) tryAutoSettle()
                 }
             },
-            onError = { msg -> runOnUiThread { status.text = "✗ $msg" } }
+            onError = { msg -> state.value = state.value.copy(status = msg, statusKind = StatusKind.Error) }
         )
 
-        settleBtn.setOnClickListener {
-            walletScope.launch { tryAutoSettle(force = true) }
+        val qrBitmap = com.offlinepay.wallet.Qr.render(keyVault.address, size = 600)
+
+        setContent {
+            OffpayTheme {
+                val s by state.collectAsState()
+                ReceiveScreen(
+                    state = s,
+                    qrBitmap = qrBitmap,
+                    onSettleNow = { walletScope.launch { tryAutoSettle(force = true) } },
+                    onScanQr = {
+                        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                                PackageManager.PERMISSION_GRANTED
+                        if (granted) launcher.launch(Intent(this, QrScanActivity::class.java))
+                        else camPermLauncher.launch(Manifest.permission.CAMERA)
+                    },
+                    onClose = { finish() },
+                )
+            }
         }
 
-        lifecycleScope.launch {
-            store.recent().collectLatest { rows ->
-                feed.text = rows.joinToString("\n") { r ->
-                    val st = when (r.status) { "accepted" -> "✓"; "settled" -> "⛓"; else -> "✗" }
-                    "$st  ${"%.2f".format(BigInteger(r.amount).toDouble() / 1e6)}  ${r.voucherId.take(10)}…  ${r.status}"
+        // Live recent
+        walletScope.launch {
+            store.recent().collect { rows ->
+                val mapped = rows.take(10).map { r ->
+                    val amt = "%.2f".format(BigInteger(r.amount).toDouble() / 1e6)
+                    when (r.status) {
+                        "settled"  -> RecentRow("Settled on chain", "INCOMING · ${r.voucherId.take(10)}…", "+ \$$amt", true)
+                        "accepted" -> RecentRow("Voucher received", "OFFLINE · PENDING SETTLE", "+ \$$amt", true)
+                        else       -> RecentRow("Rejected voucher", "ERROR · ${r.rejectReason ?: ""}", "  \$$amt", false)
+                    }
                 }
+                state.value = state.value.copy(
+                    recent = mapped,
+                    pendingCount = rows.count { it.status == "accepted" },
+                )
             }
         }
     }
@@ -129,7 +131,7 @@ class ReceiveActivity : AppCompatActivity() {
             Voucher.listFromWireJson(wireJson)
         } catch (t: Throwable) {
             Log.e(TAG, "bad json", t)
-            runOnUiThread { status.text = "✗ bad voucher json: ${t.message}" }
+            state.value = state.value.copy(status = "bad voucher json: ${t.message}", statusKind = StatusKind.Error)
             return
         }
         var totalAccepted = 0.0
@@ -145,71 +147,62 @@ class ReceiveActivity : AppCompatActivity() {
                 rejected += 1
             }
         }
-        runOnUiThread {
-            status.text = if (rejected == 0)
-                "✓ received ${"%.2f".format(totalAccepted)} USDC (${list.size} voucher${if (list.size==1) "" else "s"})"
-            else
-                "⚠ received ${list.size - rejected} of ${list.size} (${"%.2f".format(totalAccepted)} USDC; $rejected rejected)"
-        }
+        val summary = if (rejected == 0)
+            "✓ received ${"%.2f".format(totalAccepted)} USDC"
+        else
+            "received ${list.size - rejected}/${list.size} ($rejected rejected)"
+        state.value = state.value.copy(status = summary,
+            statusKind = if (rejected == 0) StatusKind.Success else StatusKind.Error)
     }
 
     private suspend fun tryAutoSettle(force: Boolean = false) {
         val pending = store.pendingForSettle()
         Log.d(TAG, "tryAutoSettle pending=${pending.size} force=$force")
         if (pending.isEmpty()) {
-            if (force) runOnUiThread { status.text = "nothing to settle" }
+            if (force) state.value = state.value.copy(status = "nothing to settle", statusKind = StatusKind.Idle)
             return
         }
-        runOnUiThread { status.text = "settling ${pending.size} via backend…" }
+        state.value = state.value.copy(status = "settling ${pending.size} on chain…", statusKind = StatusKind.Working)
         try {
-            val items = pending.map {
-                BackendClient.RedeemItem(
-                    voucher = BackendClient.VoucherFields(
-                        payer = it.payer, merchant = it.merchant,
-                        amount = it.amount, expiry = it.expiry,
-                        nonce = it.nonce, voucherId = it.voucherId
-                    ),
-                    signature = it.signature
-                )
+            runCatching { backend.init(keyVault.address, 0L) }
+            val tx = try {
+                settle.settleBearerBatch(pending, keyVault.address)
+            } catch (t: Throwable) {
+                Log.w(TAG, "direct settle failed, fallback: ${t.message}")
+                relaySettle(pending) ?: throw t
             }
-            val resp = backend.redeem(keyVault.address, items)
-            if (!resp.ok) {
-                runOnUiThread { status.text = "settle failed: ${resp.error ?: "unknown"}" }
-                return
-            }
-            val tx = resp.tx ?: ""
-            // Mark only the ones the backend actually settled. Rejected ones stay as 'accepted'.
-            val rejectedIds = resp.rejected.map { it.voucherId }.toSet()
-            val settledRows = pending.filter { it.voucherId !in rejectedIds }
-            settledRows.forEach { store.markSettled(it.voucherId, tx) }
-            runOnUiThread {
-                status.text = if (resp.rejected.isEmpty())
-                    "⛓ settled ${resp.settled} — tx ${tx.take(10)}…"
-                else
-                    "⛓ settled ${resp.settled}, rejected ${resp.rejected.size} — tx ${tx.take(10)}…"
-            }
+            pending.forEach { store.markSettled(it.voucherId, tx) }
+            state.value = state.value.copy(status = "⛓ settled ${pending.size} — tx ${tx.take(10)}…",
+                statusKind = StatusKind.Success)
         } catch (t: Throwable) {
             Log.e(TAG, "settle failed", t)
-            runOnUiThread { status.text = "settle failed: ${t.message}" }
+            state.value = state.value.copy(status = "settle failed: ${t.message}", statusKind = StatusKind.Error)
         }
     }
 
-    private fun isOnline(): Boolean {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val net = cm.activeNetwork ?: return false
-        val cap = cm.getNetworkCapabilities(net) ?: return false
-        return cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    private suspend fun relaySettle(pending: List<VoucherRow>): String? {
+        val items = pending.map {
+            BackendClient.RedeemItem(
+                voucher = BackendClient.VoucherFields(
+                    payer = it.payer, merchant = it.merchant,
+                    amount = it.amount, expiry = it.expiry,
+                    nonce = it.nonce, voucherId = it.voucherId
+                ),
+                signature = it.signature
+            )
+        }
+        val resp = backend.redeem(keyVault.address, items)
+        return if (resp.ok) resp.tx else null
     }
 
     override fun onResume() {
         super.onResume()
         reader.start()
         registerNetCallback()
-        // If we're already online and have pending vouchers, settle them now.
         if (isOnline()) walletScope.launch { tryAutoSettle() }
     }
 
-    override fun onPause()  {
+    override fun onPause() {
         unregisterNetCallback()
         reader.stop()
         super.onPause()
@@ -218,9 +211,7 @@ class ReceiveActivity : AppCompatActivity() {
     private fun registerNetCallback() {
         if (netCallback != null) return
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val req = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
+        val req = NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.d(TAG, "network available -> auto-settle")
@@ -238,6 +229,13 @@ class ReceiveActivity : AppCompatActivity() {
                 .unregisterNetworkCallback(cb)
         } catch (_: Throwable) {}
         netCallback = null
+    }
+
+    private fun isOnline(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val net = cm.activeNetwork ?: return false
+        val cap = cm.getNetworkCapabilities(net) ?: return false
+        return cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     companion object { private const val TAG = "OfflinePay/Receive" }

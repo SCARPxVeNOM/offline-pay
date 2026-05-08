@@ -6,15 +6,16 @@ import android.util.Log
 
 /// HCE service for the Send role.
 ///
-/// Custodial mode: vouchers are pre-signed by the backend at topup time.
-/// SendActivity picks one or more, stages them as a JSON-array payload via
-/// [PendingPayment], and the HCE just emits the bytes — no signing here.
+/// Option B (non-custodial): the SENDER signs the voucher at tap time
+/// using its own private key + persistent NonceTracker. payer field of
+/// the voucher = this device's wallet address. Receiver verifies the
+/// signature recovers to that address.
 ///
 /// Protocol:
-///   SELECT AID                 → 9000
-///   00 C1 00 00 14 <recv addr> → <2-byte BE len><JSON array of card payloads> 9000
-///                              → 6A 82  (no pending payment)
-///                              → 6F 00  (internal)
+///   SELECT AID                       → 9000
+///   00 C1 00 00 14 <recv addr>       → <2-byte BE len><card-payload JSON> 9000
+///                                    → 6A 82  (no pending payment armed)
+///                                    → 6F 00  (signing failed)
 class HceVoucherService : HostApduService() {
 
     override fun processCommandApdu(commandApdu: ByteArray, extras: Bundle?): ByteArray {
@@ -28,8 +29,15 @@ class HceVoucherService : HostApduService() {
             Log.w(TAG, "unknown INS -> 6D 00")
             return SW_INS_NOT_SUPPORTED
         }
-        // Receiver address bytes are accepted but unused — bearer vouchers
-        // are claimed by whoever forwards them to the backend.
+        val lc = commandApdu[4].toInt() and 0xFF
+        if (lc != 20 || commandApdu.size < 5 + lc) {
+            PendingPayment.reportError(ctx, "malformed REQUEST_PAY apdu")
+            return SW_WRONG_LENGTH
+        }
+        val addrBytes = commandApdu.copyOfRange(5, 5 + 20)
+        val receiver = "0x" + addrBytes.joinToString("") { "%02x".format(it) }
+        Log.d(TAG, "INS 0xC1 receiver=$receiver")
+
         val pending = PendingPayment.consume(ctx) ?: run {
             Log.w(TAG, "no pending payment armed -> 6A 82")
             PendingPayment.reportError(ctx, "no pending payment armed")
@@ -37,15 +45,33 @@ class HceVoucherService : HostApduService() {
         }
 
         return try {
-            val bytes = pending.payload.toByteArray(Charsets.UTF_8)
-            val len = bytes.size
-            Log.d(TAG, "emit ${pending.voucherIds.size} voucher(s) totalBytes=$len")
-            PendingPayment.reportSpent(ctx, pending.voucherIds)
-            byteArrayOf(((len shr 8) and 0xFF).toByte(), (len and 0xFF).toByte()) +
-                    bytes + SUCCESS
+            val keyVault = KeyVault(ctx)
+            val nonces = NonceTracker(ctx)
+            val signer = VoucherSigner(
+                chainId = Config.CHAIN_ID,
+                vaultAddress = Config.VAULT_ADDRESS,
+                keyPair = keyVault.keyPair,
+                payerAddress = keyVault.address,
+                nonces = nonces
+            )
+            // Bearer voucher (merchant=null=0x0): receiver settles bearer
+            // batch on-chain. We set merchant to bearer for cross-receiver
+            // flexibility; if you want strict recipient-binding, pass
+            // merchant=receiver here instead.
+            val ttl = (pending.expiry - System.currentTimeMillis() / 1000).coerceAtLeast(60)
+            val signed = signer.signNext(merchant = null, amountUsdc = pending.amountUsdc, ttlSeconds = ttl)
+            val payload = signed.toCardJson().toByteArray(Charsets.UTF_8)
+            val len = payload.size
+            Log.d(TAG, "signed voucher id=${signed.voucherId.take(10)} len=$len")
+            PendingPayment.reportOutgoing(ctx, signed.voucherId, receiver, pending.amountUsdc)
+            // Wrap as JSON array to match the receiver's listFromWireJson parser.
+            val wireBytes = ("[" + signed.toCardJson() + "]").toByteArray(Charsets.UTF_8)
+            val wlen = wireBytes.size
+            byteArrayOf(((wlen shr 8) and 0xFF).toByte(), (wlen and 0xFF).toByte()) +
+                    wireBytes + SUCCESS
         } catch (t: Throwable) {
-            Log.e(TAG, "emit failed", t)
-            PendingPayment.reportError(ctx, "emit failed: ${t.message}")
+            Log.e(TAG, "sign failed", t)
+            PendingPayment.reportError(ctx, "sign failed: ${t.message}")
             SW_INTERNAL
         }
     }
@@ -57,6 +83,7 @@ class HceVoucherService : HostApduService() {
         private val SUCCESS              = byteArrayOf(0x90.toByte(), 0x00.toByte())
         private val SW_FILE_NOT_FOUND    = byteArrayOf(0x6A.toByte(), 0x82.toByte())
         private val SW_INS_NOT_SUPPORTED = byteArrayOf(0x6D.toByte(), 0x00.toByte())
+        private val SW_WRONG_LENGTH      = byteArrayOf(0x67.toByte(), 0x00.toByte())
         private val SW_INTERNAL          = byteArrayOf(0x6F.toByte(), 0x00.toByte())
     }
 }
