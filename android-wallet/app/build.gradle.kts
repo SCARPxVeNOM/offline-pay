@@ -53,7 +53,9 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Web3j: secp256k1, EIP-191, JSON-RPC, ABI encoding.
-    implementation("org.web3j:core:4.12.2") { exclude(group = "org.slf4j") }
+    implementation("org.web3j:core:4.12.2")
+    // No-op slf4j binding so HttpService.<clinit> doesn't NoClassDefFoundError at runtime.
+    implementation("org.slf4j:slf4j-nop:1.7.36")
 
     // Room (voucher store).
     implementation("androidx.room:room-runtime:2.6.1")
