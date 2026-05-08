@@ -29,6 +29,7 @@
         <activity android:name=".TopupActivity"    android:exported="false" />
         <activity android:name=".HistoryActivity"  android:exported="false" />
         <activity android:name=".BackupRestoreActivity" android:exported="false" />
+        <activity android:name=".QrScanActivity" android:exported="false" />
 
         <service
             android:name=".HceVoucherService"

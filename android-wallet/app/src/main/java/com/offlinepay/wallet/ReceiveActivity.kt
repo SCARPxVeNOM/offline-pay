@@ -1,11 +1,17 @@
 package com.offlinepay.wallet
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -43,11 +49,33 @@ class ReceiveActivity : AppCompatActivity() {
         status = TextView(this).apply { text = "scanning… tap a sender phone to your back"; textSize = 14f }
         feed   = TextView(this).apply { textSize = 12f; typeface = android.graphics.Typeface.MONOSPACE }
         val settleBtn = Button(this).apply { text = "Settle now" }
+        val scanBtn = Button(this).apply { text = "Scan voucher QR" }
 
-        listOf(addrView, addrQr, status, settleBtn, feed).forEach { root.addView(it) }
+        listOf(addrView, addrQr, status, settleBtn, scanBtn, feed).forEach { root.addView(it) }
         setContentView(root)
 
         addrQr.setImageBitmap(Qr.render(keyVault.address))
+
+        val launcher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { res ->
+            if (res.resultCode == RESULT_OK) {
+                val qr = res.data?.getStringExtra("qr") ?: return@registerForActivityResult
+                lifecycleScope.launch { handleIncoming(qr); if (isOnline()) tryAutoSettle() }
+            }
+        }
+        val camPermLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            if (granted) launcher.launch(Intent(this, QrScanActivity::class.java))
+            else runOnUiThread { status.text = "✗ camera permission denied" }
+        }
+        scanBtn.setOnClickListener {
+            val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+            if (granted) launcher.launch(Intent(this, QrScanActivity::class.java))
+            else camPermLauncher.launch(Manifest.permission.CAMERA)
+        }
 
         reader = ReaderModeLoop(
             this,
