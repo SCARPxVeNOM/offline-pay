@@ -15,6 +15,9 @@ import org.web3j.protocol.http.HttpService
 import org.web3j.utils.Numeric
 import java.math.BigInteger
 
+// Disambiguate from kotlin.Function (which expects a type argument).
+private typealias Web3Function = org.web3j.abi.datatypes.Function
+
 /// Calls OfflineVault.settleBatch directly from this device's wallet.
 /// Caller MUST have MATIC for gas. Returns the tx hash on success.
 class SettlementClient(
@@ -106,7 +109,7 @@ class SettlementClient(
                 emptyList())
         }
 
-    private suspend fun sendWrite(to: String, fn: () -> Function): String = withContext(Dispatchers.IO) {
+    private suspend fun sendWrite(to: String, fn: () -> Web3Function): String = withContext(Dispatchers.IO) {
         val data = FunctionEncoder.encode(fn())
         val nonce = web3.ethGetTransactionCount(
             fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING

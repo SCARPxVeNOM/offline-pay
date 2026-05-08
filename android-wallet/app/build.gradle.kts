@@ -7,12 +7,12 @@ plugins {
 
 android {
     namespace = "com.offlinepay.wallet"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.offlinepay.wallet"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -24,6 +24,21 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { buildConfig = true }
+
+    // Web3j sub-deps (tuweni-units, tuweni-bytes) ship duplicate META-INF text.
+    packaging {
+        resources {
+            excludes += listOf(
+                "META-INF/DISCLAIMER",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1",
+                "META-INF/INDEX.LIST",
+                "META-INF/io.netty.versions.properties",
+            )
+        }
+    }
 }
 
 dependencies {

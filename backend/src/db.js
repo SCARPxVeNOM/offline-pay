@@ -1,11 +1,11 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
 
 fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
-export const db = new Database(config.dbPath);
-db.pragma("journal_mode = WAL");
+export const db = new DatabaseSync(config.dbPath);
+db.exec("PRAGMA journal_mode = WAL");
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS customers (
@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS vouchers (
   expiry     INTEGER NOT NULL,
   nonce      INTEGER NOT NULL,
   signature  TEXT NOT NULL,
-  status     TEXT NOT NULL DEFAULT 'issued',  -- issued | redeemed | settled | expired
+  status     TEXT NOT NULL DEFAULT 'issued',
   issued_at  INTEGER NOT NULL,
   redeemed_at INTEGER,
   settled_tx TEXT
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS topups (
   upi_ref  TEXT,
   amount_inr_paise INTEGER NOT NULL,
   amount_usdc      TEXT NOT NULL,
-  status TEXT NOT NULL,  -- pending | locked | failed
+  status TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 `);
