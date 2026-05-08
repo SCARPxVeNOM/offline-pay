@@ -240,6 +240,27 @@ const pepperLimiter = rateLimit({
   handler: (_req, res) => res.status(429).json({ error: "too many attempts" }),
 });
 
+// ─── Faucet — mint MockUSDC directly to a user wallet (P2P demo path) ────
+// Real USDC has no public mint; in production replace with an actual on-ramp.
+const faucetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10,
+  standardHeaders: true, legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ error: "rate limited" }),
+});
+
+app.post("/api/faucet", faucetLimiter, async (req, res) => {
+  if (!usdc) return res.status(503).json({ error: "chain not configured" });
+  try {
+    const { address, amountUsdc } = req.body || {};
+    if (!ethers.isAddress(address)) return res.status(400).json({ error: "bad address" });
+    const amt = BigInt(amountUsdc || 5_000_000); // default $5
+    if (amt <= 0n || amt > 100_000_000n) return res.status(400).json({ error: "amount out of range" });
+    const tx = await usdc.mint(address, amt);
+    const rcpt = await tx.wait();
+    res.json({ ok: true, tx: rcpt.hash, amountUsdc: amt.toString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/api/keybackup/pepper/:userId", pepperLimiter, (req, res) => {
   if (!req.params.userId || req.params.userId.length > 256) {
     return res.status(400).json({ error: "bad userId" });
