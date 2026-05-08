@@ -91,4 +91,32 @@ class SettlementClient(
         if (resp.hasError()) BigInteger.ZERO
         else BigInteger(resp.value.removePrefix("0x").ifEmpty { "0" }, 16)
     }
+
+    suspend fun approveUsdc(usdcAddr: String, spender: String, amount: BigInteger): String =
+        sendWrite(usdcAddr) {
+            Function("approve",
+                listOf(Address(spender), Uint256(amount)),
+                emptyList())
+        }
+
+    suspend fun lockFunds(amount: BigInteger): String =
+        sendWrite(vaultAddress) {
+            Function("lockFunds",
+                listOf(Uint256(amount)),
+                emptyList())
+        }
+
+    private suspend fun sendWrite(to: String, fn: () -> Function): String = withContext(Dispatchers.IO) {
+        val data = FunctionEncoder.encode(fn())
+        val nonce = web3.ethGetTransactionCount(
+            fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING
+        ).send().transactionCount
+        val gasPrice = web3.ethGasPrice().send().gasPrice
+        val gasLimit = BigInteger.valueOf(200_000L)
+        val tx = RawTransaction.createTransaction(nonce, gasPrice, gasLimit, to, BigInteger.ZERO, data)
+        val signed = TransactionEncoder.signMessage(tx, chainId, org.web3j.crypto.Credentials.create(keyPair))
+        val resp = web3.ethSendRawTransaction(Numeric.toHexString(signed)).send()
+        if (resp.hasError()) error("write failed: ${resp.error.message}")
+        resp.transactionHash
+    }
 }
