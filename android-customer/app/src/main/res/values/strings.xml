@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OfflinePay Wallet</string>
+    <string name="service_desc">OfflinePay voucher emulator</string>
+    <string name="aid_group_desc">OfflinePay AID</string>
+</resources>

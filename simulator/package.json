@@ -1,0 +1,16 @@
+{
+  "name": "offlinepay-simulator",
+  "version": "1.0.0",
+  "description": "End-to-end demo + ESP32 emulator for OfflinePay",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "demo":   "node demo.js",
+    "tap":    "node tap.js",
+    "stress": "node stress.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "node-fetch": "^3.3.2"
+  }
+}

@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OfflinePay — live console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; background: #0b0d12; }
+    .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+    .card { background: linear-gradient(180deg,#161a23,#10131b); }
+    .grad-text {
+      background: linear-gradient(90deg,#a5f3fc,#c4b5fd,#fda4af);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .btn {
+      background: linear-gradient(180deg,#1f2937,#111827);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 1px 2px rgba(0,0,0,0.4);
+    }
+    .btn:hover { background: linear-gradient(180deg,#283347,#161e2c); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .pulse { animation: pulse 1.4s ease-out infinite; }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.55); }
+      100% { box-shadow: 0 0 0 16px rgba(34,197,94,0);   }
+    }
+    .scrollbar::-webkit-scrollbar { width: 6px; }
+    .scrollbar::-webkit-scrollbar-thumb { background: #2a3144; border-radius: 3px; }
+    .stat-grow { animation: grow 0.4s ease; }
+    @keyframes grow { from { transform: scale(0.95); opacity: 0.5; } to { transform: scale(1); opacity: 1; } }
+  </style>
+</head>
+<body class="text-slate-200">
+
+<header class="border-b border-slate-800/80 bg-slate-950/80 backdrop-blur sticky top-0 z-10">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="h-9 w-9 rounded-lg bg-gradient-to-br from-cyan-400 to-violet-500 flex items-center justify-center font-bold text-slate-900">⏻</div>
+      <div>
+        <div class="text-sm text-slate-400">OfflinePay</div>
+        <div class="font-bold text-lg leading-tight grad-text">offline crypto payments for India</div>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <div id="health-pill" class="text-xs px-3 py-1.5 rounded-full bg-slate-800 mono">checking…</div>
+      <div class="text-xs px-3 py-1.5 rounded-full bg-slate-800 mono" id="block-pill">block ?</div>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-6 py-8 space-y-6">
+
+  <!-- Top stats row -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-xs text-slate-400 uppercase tracking-wider">Issued</div>
+      <div id="stat-issued" class="text-3xl font-bold mt-1 stat-grow">—</div>
+      <div class="text-xs text-slate-500 mt-1">vouchers signed</div>
+    </div>
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-xs text-slate-400 uppercase tracking-wider">Redeemed</div>
+      <div id="stat-redeemed" class="text-3xl font-bold mt-1 text-amber-300 stat-grow">—</div>
+      <div class="text-xs text-slate-500 mt-1">offline taps queued</div>
+    </div>
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-xs text-slate-400 uppercase tracking-wider">Settled on chain</div>
+      <div id="stat-settled" class="text-3xl font-bold mt-1 text-emerald-300 stat-grow">—</div>
+      <div class="text-xs text-slate-500 mt-1">USDC paid to merchants</div>
+    </div>
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-xs text-slate-400 uppercase tracking-wider">Volume</div>
+      <div id="stat-volume" class="text-3xl font-bold mt-1 grad-text stat-grow">$0.00</div>
+      <div class="text-xs text-slate-500 mt-1">cumulative</div>
+    </div>
+  </section>
+
+  <div class="grid lg:grid-cols-3 gap-6">
+
+    <!-- Demo console -->
+    <section class="card rounded-2xl p-5 ring-1 ring-slate-800 lg:col-span-1 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="font-bold text-lg">Demo console</h3>
+        <span class="text-xs text-slate-500">click through the flow</span>
+      </div>
+
+      <div class="space-y-3">
+
+        <div>
+          <label class="text-xs text-slate-400">Step 1 — UPI top-up</label>
+          <div class="flex gap-2 mt-1">
+            <input id="topup-amount" type="number" min="1" max="50000" value="100" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 w-24 mono text-sm" />
+            <span class="self-center text-slate-400 text-sm">INR</span>
+            <button onclick="doTopup()" class="btn rounded-lg px-4 py-2 text-sm font-medium ml-auto" id="btn-topup">Top up</button>
+          </div>
+        </div>
+
+        <div>
+          <label class="text-xs text-slate-400">Step 2 — load vouchers onto card</label>
+          <div class="flex gap-2 mt-1">
+            <input id="issue-count" type="number" min="1" max="10" value="5" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 w-20 mono text-sm" />
+            <span class="self-center text-slate-400 text-sm">×</span>
+            <input id="issue-amount" type="number" min="10000" max="2000000" step="10000" value="200000" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 w-32 mono text-sm" />
+            <span class="self-center text-slate-400 text-sm">µUSDC</span>
+            <button onclick="doIssue()" class="btn rounded-lg px-4 py-2 text-sm font-medium ml-auto" id="btn-issue">Issue</button>
+          </div>
+        </div>
+
+        <div>
+          <label class="text-xs text-slate-400">Step 3 — offline taps</label>
+          <div class="flex items-center gap-2 mt-1">
+            <span class="self-center text-slate-400 text-sm flex-1">tap the customer's card on a merchant phone</span>
+            <button onclick="doTap()" class="btn rounded-lg px-4 py-2 text-sm font-medium" id="btn-tap">Tap card</button>
+          </div>
+        </div>
+
+        <div>
+          <label class="text-xs text-slate-400">Step 4 — settle on Polygon</label>
+          <div class="flex items-center gap-2 mt-1">
+            <span class="self-center text-slate-400 text-sm flex-1">batch all queued vouchers into one tx</span>
+            <button onclick="doSettle()" class="btn rounded-lg px-4 py-2 text-sm font-medium" id="btn-settle">Settle</button>
+          </div>
+        </div>
+
+        <button onclick="runFullDemo()" class="w-full mt-4 rounded-xl py-3 font-semibold text-slate-900 bg-gradient-to-r from-cyan-300 via-violet-300 to-pink-300 hover:opacity-90 transition" id="btn-full">Run end-to-end demo</button>
+      </div>
+
+      <div id="log" class="text-xs mono mt-4 h-44 overflow-auto space-y-1 scrollbar bg-slate-950/60 p-3 rounded-lg ring-1 ring-slate-800"></div>
+    </section>
+
+    <!-- Voucher feed -->
+    <section class="card rounded-2xl ring-1 ring-slate-800 lg:col-span-2">
+      <div class="flex items-center justify-between p-5 border-b border-slate-800">
+        <div>
+          <h3 class="font-bold text-lg">Live voucher feed</h3>
+          <div class="text-xs text-slate-500">most recent 25 — auto-refreshes every 1.5 s</div>
+        </div>
+        <div class="flex gap-1.5">
+          <span class="h-2 w-2 rounded-full bg-emerald-400 pulse"></span>
+        </div>
+      </div>
+      <div class="overflow-auto scrollbar max-h-[640px]">
+        <table class="w-full text-sm">
+          <thead class="text-xs uppercase text-slate-500 sticky top-0 bg-slate-950/80 backdrop-blur">
+            <tr>
+              <th class="text-left px-5 py-2">voucher</th>
+              <th class="text-right px-5 py-2">amount</th>
+              <th class="text-center px-5 py-2">status</th>
+              <th class="text-left px-5 py-2">tx</th>
+            </tr>
+          </thead>
+          <tbody id="voucher-rows" class="divide-y divide-slate-800/60">
+            <tr><td colspan="4" class="text-center py-10 text-slate-500">no vouchers yet — run the demo</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Pitch / footer -->
+  <section class="grid md:grid-cols-3 gap-6 pt-4">
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-cyan-300 text-2xl">⛓</div>
+      <h4 class="font-bold mt-1">cryptographic vouchers</h4>
+      <p class="text-sm text-slate-400 mt-2">secp256k1 ECDSA, EIP-191 hashed. The same signature settles on Polygon and verifies offline on the merchant phone.</p>
+    </div>
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-violet-300 text-2xl">⚡</div>
+      <h4 class="font-bold mt-1">no bank in the path</h4>
+      <p class="text-sm text-slate-400 mt-2">UPI Lite needs the issuer bank online. OfflinePay's vouchers are self-verifying, so a kirana store and a delivery partner can transact in a power cut.</p>
+    </div>
+    <div class="card rounded-2xl p-5 ring-1 ring-slate-800">
+      <div class="text-pink-300 text-2xl">📶</div>
+      <h4 class="font-bold mt-1">card or phone</h4>
+      <p class="text-sm text-slate-400 mt-2">Smartphone customer? HCE. Feature phone? MIFARE card or key fob. Same crypto, two form factors, one settlement layer.</p>
+    </div>
+  </section>
+
+  <div class="text-center text-xs text-slate-600 py-8 mono" id="footer-info"></div>
+
+</main>
+
+<script>
+  const API = window.OFFLINEPAY_API || "http://localhost:4000";
+  const CUSTOMER  = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+
+  function fmtUsd(units) { return "$" + (Number(units || 0)/1e6).toFixed(2); }
+  function shortHex(h) { return h ? h.slice(0,10) + "…" + h.slice(-4) : ""; }
+
+  function log(msg, kind="info") {
+    const el = document.getElementById("log");
+    const colors = { info: "text-slate-400", ok: "text-emerald-300", err: "text-rose-300", warn: "text-amber-300" };
+    const t = new Date().toLocaleTimeString();
+    const div = document.createElement("div");
+    div.className = colors[kind] || "text-slate-400";
+    div.textContent = `[${t}] ${msg}`;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  async function api(method, path, body) {
+    const r = await fetch(API + path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(out.error || ("HTTP " + r.status));
+    return out;
+  }
+
+  function setBusy(busy) {
+    for (const id of ["btn-topup","btn-issue","btn-tap","btn-settle","btn-full"]) {
+      document.getElementById(id).disabled = busy;
+    }
+  }
+
+  // Local state — vouchers we've issued but not yet redeemed.
+  // (in real app, these live on the customer's MIFARE card)
+  let LOCAL_CARD = [];
+
+  async function doTopup() {
+    setBusy(true);
+    try {
+      const inr = Number(document.getElementById("topup-amount").value || 100);
+      const out = await api("POST", "/api/topup", { customer: CUSTOMER, amountInrPaise: inr * 100 });
+      log(`topup ₹${inr} → locked ${fmtUsd(out.amountUsdc)} (UPI ref ${out.upiRef})`, "ok");
+    } catch (e) { log("topup failed: " + e.message, "err"); }
+    setBusy(false);
+    refresh();
+  }
+
+  async function doIssue() {
+    setBusy(true);
+    try {
+      const count   = Number(document.getElementById("issue-count").value || 5);
+      const amount  = Number(document.getElementById("issue-amount").value || 200000);
+      const out = await api("POST", "/api/vouchers/issue", { customer: CUSTOMER, count, amountUsdcEach: amount });
+      LOCAL_CARD.push(...out.vouchers);
+      log(`issued ${out.vouchers.length} vouchers, written to card. on-card: ${LOCAL_CARD.length}`, "ok");
+    } catch (e) { log("issue failed: " + e.message, "err"); }
+    setBusy(false);
+    refresh();
+  }
+
+  async function doTap() {
+    setBusy(true);
+    try {
+      if (LOCAL_CARD.length === 0) {
+        log("card empty — issue some vouchers first", "warn");
+      } else {
+        const v = LOCAL_CARD.shift();
+        const out = await api("POST", "/api/merchant/redeem", { vouchers: [v] });
+        if (out.accepted.length) log(`tap → ACCEPTED voucher ${shortHex(v.voucher.voucherId)}`, "ok");
+        else                     log(`tap → REJECTED ${out.rejected[0].reason}`, "err");
+      }
+    } catch (e) { log("tap failed: " + e.message, "err"); }
+    setBusy(false);
+    refresh();
+  }
+
+  async function doSettle() {
+    setBusy(true);
+    try {
+      const out = await api("POST", "/api/merchant/settle", {});
+      if (out.settled > 0) log(`settled ${out.settled} on-chain — tx ${shortHex(out.tx)}`, "ok");
+      else                 log(`nothing to settle`, "warn");
+    } catch (e) { log("settle failed: " + e.message, "err"); }
+    setBusy(false);
+    refresh();
+  }
+
+  async function runFullDemo() {
+    log("starting end-to-end demo…", "info");
+    setBusy(true);
+    try {
+      const t = await api("POST", "/api/topup", { customer: CUSTOMER, amountInrPaise: 10000 });
+      log(`step 1: topup ₹100 ok, locked ${fmtUsd(t.amountUsdc)}`, "ok");
+
+      const issued = await api("POST", "/api/vouchers/issue",
+        { customer: CUSTOMER, count: 5, amountUsdcEach: 200000 });
+      LOCAL_CARD.push(...issued.vouchers);
+      log(`step 2: issued 5 vouchers (signed offline-ready)`, "ok");
+      await refresh();
+
+      for (let i = 0; i < 5; i++) {
+        const v = LOCAL_CARD.shift();
+        await api("POST", "/api/merchant/redeem", { vouchers: [v] });
+        log(`step 3: tap ${i+1}/5 → accepted ${shortHex(v.voucher.voucherId)}`, "ok");
+        await refresh();
+        await new Promise(r => setTimeout(r, 250));
+      }
+
+      const out = await api("POST", "/api/merchant/settle", {});
+      log(`step 4: batch settled ${out.settled} on chain — tx ${shortHex(out.tx)}`, "ok");
+      log("demo complete ✓", "ok");
+    } catch (e) {
+      log("demo failed: " + e.message, "err");
+    }
+    setBusy(false);
+    refresh();
+  }
+
+  // ─── Live polling ──────────────────────────────────────────────
+  async function refresh() {
+    try {
+      const [stats, health] = await Promise.all([
+        api("GET", "/api/stats"),
+        api("GET", "/api/health"),
+      ]);
+
+      const counts = Object.fromEntries(stats.counts.map(c => [c.status, c]));
+      const issued    = (counts.issued?.n   || 0) + (counts.redeemed?.n||0) + (counts.settled?.n||0);
+      const redeemed  = counts.redeemed?.n  || 0;
+      const settled   = counts.settled?.n   || 0;
+      const volume    = (counts.settled?.vol || 0);
+      document.getElementById("stat-issued").textContent   = issued;
+      document.getElementById("stat-redeemed").textContent = redeemed;
+      document.getElementById("stat-settled").textContent  = settled;
+      document.getElementById("stat-volume").textContent   = fmtUsd(volume);
+
+      document.getElementById("health-pill").textContent =
+        health.ok ? `chain ${health.chainId}` : "offline";
+      document.getElementById("health-pill").className =
+        "text-xs px-3 py-1.5 rounded-full mono " +
+        (health.ok ? "bg-emerald-900/40 text-emerald-300 ring-1 ring-emerald-800" : "bg-rose-900/40 text-rose-300");
+      document.getElementById("block-pill").textContent  = `block ${health.blockNumber}`;
+
+      const tbody = document.getElementById("voucher-rows");
+      if (!stats.recent.length) {
+        tbody.innerHTML = `<tr><td colspan="4" class="text-center py-10 text-slate-500">no vouchers yet — run the demo</td></tr>`;
+      } else {
+        tbody.innerHTML = stats.recent.map(r => {
+          const badge = {
+            issued:   "bg-slate-700 text-slate-200",
+            redeemed: "bg-amber-900/60 text-amber-200 ring-1 ring-amber-800",
+            settled:  "bg-emerald-900/60 text-emerald-200 ring-1 ring-emerald-800",
+          }[r.status] || "bg-slate-700";
+          return `
+            <tr class="hover:bg-slate-800/40">
+              <td class="px-5 py-2 mono text-xs text-slate-300">${shortHex(r.voucher_id)}</td>
+              <td class="px-5 py-2 text-right mono">${fmtUsd(r.amount)}</td>
+              <td class="px-5 py-2 text-center"><span class="text-xs px-2 py-0.5 rounded-full ${badge}">${r.status}</span></td>
+              <td class="px-5 py-2 mono text-xs text-slate-500">${r.settled_tx ? shortHex(r.settled_tx) : "—"}</td>
+            </tr>
+          `;
+        }).join("");
+      }
+
+      document.getElementById("footer-info").textContent =
+        `vault ${health.vault || "—"}   ·   usdc ${health.usdc || "—"}   ·   signer ${health.backendSigner || "—"}`;
+    } catch (e) {
+      document.getElementById("health-pill").textContent = "backend offline";
+      document.getElementById("health-pill").className = "text-xs px-3 py-1.5 rounded-full bg-rose-900/40 text-rose-300 ring-1 ring-rose-800 mono";
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 1500);
+</script>
+</body>
+</html>

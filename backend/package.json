@@ -1,0 +1,21 @@
+{
+  "name": "offlinepay-backend",
+  "version": "1.0.0",
+  "description": "Voucher issuer + UPI/USDC bridge + settlement queue for OfflinePay",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "express": "^4.21.0",
+    "morgan": "^1.10.0",
+    "uuid": "^10.0.0"
+  }
+}
