@@ -6,11 +6,11 @@ object Config {
     // Polygon Amoy testnet defaults. Replace with deployment outputs.
     // For local Hardhat testing on phones over LAN: 31337L + LAN URL.
     const val CHAIN_ID = 80002L
-    const val VAULT_ADDRESS  = "0x0b34C69769efAEf83426e701D0Eba72B638cd818"
-    const val USDC_ADDRESS   = "0xFE3BdFF9Da209197b30Ab1A4CcdA240665cf15d0"
+    const val VAULT_ADDRESS  = "0x30b01f8e5Ed5E3b958f0009019fd3f3b9b5d6cE5"
+    const val USDC_ADDRESS   = "0x03Ad909F2b68328ED1606dDD894816978A0CE7a1"
 
-    // RPC for direct settle. Public Amoy RPC works for the demo.
-    const val RPC_URL        = "https://rpc-amoy.polygon.technology"
+    // RPC unused on the phone in custodial mode — backend does all chain ops.
+    const val RPC_URL        = "https://polygon-amoy.infura.io/v3/63a92704fd4c46b5957bf6a6764f21d2"
 
     // Backend reachable via `adb reverse tcp:4000 tcp:4000` (USB tunnel).
     // For LAN testing replace with the laptop's IPv4, e.g. http://192.168.x.x:4000.

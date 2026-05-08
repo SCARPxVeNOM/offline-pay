@@ -5,48 +5,66 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
-import java.math.BigInteger
 
 class TopupActivity : AppCompatActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         val keyVault = KeyVault(this)
-        val faucet = FaucetClient(Config.BACKEND_BASE)
-        val settle = SettlementClient(
-            Config.RPC_URL, Config.VAULT_ADDRESS, Config.CHAIN_ID,
-            keyVault.keyPair, keyVault.address
-        )
+        val store = UnspentStore(this)
+        val backend = BackendClient(Config.BACKEND_BASE)
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
-        val amount = EditText(this).apply { hint = "USDC to top up"; setText("5.00") }
-        val btn    = Button(this).apply { text = "Mint + lock" }
+        val total = EditText(this).apply { hint = "total USDC"; setText("5.00") }
+        val denom = EditText(this).apply { hint = "denomination USDC"; setText("0.50") }
+        val btn   = Button(this).apply { text = "Top up" }
         val status = TextView(this).apply { textSize = 14f }
-        listOf(amount, btn, status).forEach { root.addView(it) }
+        val hint = TextView(this).apply {
+            text = "topup runs online. The backend mints, locks, and pre-signs N bearer\n" +
+                   "vouchers of the chosen denomination — phone stores them for offline taps."
+            textSize = 12f; setTextColor(0xFF6E7280.toInt()); setPadding(0, 24, 0, 0)
+        }
+        listOf(total, denom, btn, status, hint).forEach { root.addView(it) }
         setContentView(root)
 
         btn.setOnClickListener {
-            val baseUnits = parseUsdc(amount.text.toString()) ?: run {
+            val totalBase = parseUsdc(total.text.toString())
+            val denomBase = parseUsdc(denom.text.toString())
+            if (totalBase == null || denomBase == null || denomBase <= 0L) {
                 status.text = "bad amount"; return@setOnClickListener
             }
+            if (totalBase % denomBase != 0L) {
+                status.text = "total must be a multiple of denomination"; return@setOnClickListener
+            }
+            val count = (totalBase / denomBase).toInt()
+            if (count <= 0 || count > 50) {
+                status.text = "count out of range (1-50)"; return@setOnClickListener
+            }
             lifecycleScope.launch {
+                status.text = "minting + locking + pre-signing $count vouchers…"
                 runCatching {
-                    status.text = "minting…"
-                    val r = faucet.mint(keyVault.address, baseUnits.toString())
-                    if (!r.ok) error(r.error ?: "faucet failed")
-                    status.text = "approving vault…"
-                    settle.approveUsdc(Config.USDC_ADDRESS, Config.VAULT_ADDRESS, baseUnits)
-                    status.text = "locking…"
-                    val tx = settle.lockFunds(baseUnits)
-                    status.text = "✓ locked ${amount.text} USDC — tx ${tx.take(10)}…"
+                    val r = backend.topup(keyVault.address, totalBase, denomBase, count)
+                    if (!r.ok) error(r.error ?: "backend rejected")
+                    val rows = r.vouchers.map { iv ->
+                        UnspentRow(
+                            voucherId = iv.voucher.voucherId,
+                            amountBaseUnits = iv.voucher.amount.toLong(),
+                            cardPayload = iv.cardPayload,
+                            addedAtMs = System.currentTimeMillis(),
+                            status = "unspent",
+                            spentAtMs = null,
+                        )
+                    }
+                    store.add(rows)
+                    status.text = "✓ topped up ${total.text} USDC — ${rows.size} × ${denom.text} ready to tap"
                 }.onFailure { status.text = "✗ ${it.message}" }
             }
         }
     }
 
-    private fun parseUsdc(text: String): BigInteger? = try {
+    private fun parseUsdc(text: String): Long? = try {
         val parts = text.trim().split(".")
         val whole = parts[0].toLong()
         val frac = parts.getOrNull(1)?.padEnd(6, '0')?.take(6)?.toLong() ?: 0L
-        BigInteger.valueOf(whole * 1_000_000 + frac)
+        whole * 1_000_000 + frac
     } catch (_: Throwable) { null }
 }

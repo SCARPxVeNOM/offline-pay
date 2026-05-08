@@ -19,25 +19,31 @@ class ReaderModeLoop(
     private val flags = NfcAdapter.FLAG_READER_NFC_A or
                         NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
     private val callback = NfcAdapter.ReaderCallback { tag -> onTag(tag) }
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var scope = newScope()
+    private fun newScope() = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     fun start() {
         val adapter = NfcAdapter.getDefaultAdapter(activity)
             ?: return onError.invoke("NFC not available on this device")
+        if (!scope.isActive) scope = newScope()
+        Log.d(TAG, "enableReaderMode flags=$flags addr=$ourAddressHex")
         adapter.enableReaderMode(activity, callback, flags, null)
     }
 
     fun stop() {
+        Log.d(TAG, "disableReaderMode")
         NfcAdapter.getDefaultAdapter(activity)?.disableReaderMode(activity)
         scope.cancel()
     }
 
     private fun onTag(tag: Tag) {
+        Log.d(TAG, "onTag id=${tag.id.joinToString("") { "%02x".format(it) }} techs=${tag.techList.joinToString(",")}")
         val isoDep = IsoDep.get(tag) ?: return onError.invoke("tag is not IsoDep")
         scope.launch {
             try {
                 isoDep.connect()
                 isoDep.timeout = 3000
+                Log.d(TAG, "isoDep connected")
 
                 val select = byteArrayOf(
                     0x00, 0xA4.toByte(), 0x04, 0x00,
@@ -45,6 +51,7 @@ class ReaderModeLoop(
                     0x10, 0xAC.toByte(), 0x1D
                 )
                 val selResp = isoDep.transceive(select)
+                Log.d(TAG, "SELECT resp (${selResp.size}B): ${hex(selResp)}")
                 if (!endsWith9000(selResp)) {
                     onError.invoke("SELECT failed: ${hex(selResp)}"); return@launch
                 }
@@ -52,15 +59,19 @@ class ReaderModeLoop(
                 val addrBytes = hexToBytes(ourAddressHex.removePrefix("0x"))
                 require(addrBytes.size == 20) { "bad addr size" }
                 val req = byteArrayOf(0x00, 0xC1.toByte(), 0x00, 0x00, 0x14) + addrBytes
+                Log.d(TAG, "REQUEST_PAY out: ${hex(req)}")
                 val resp = isoDep.transceive(req)
+                Log.d(TAG, "REQUEST_PAY resp (${resp.size}B), tail=${hex(resp.takeLastSw())}")
                 if (!endsWith9000(resp)) {
                     onError.invoke("REQUEST_PAY rejected: ${hex(resp.takeLastSw())}")
                     return@launch
                 }
                 if (resp.size < 4) { onError.invoke("short response"); return@launch }
                 val len = ((resp[0].toInt() and 0xFF) shl 8) or (resp[1].toInt() and 0xFF)
+                Log.d(TAG, "payload len=$len")
                 if (resp.size < 2 + len + 2) { onError.invoke("truncated payload"); return@launch }
                 val payload = resp.copyOfRange(2, 2 + len).toString(Charsets.UTF_8)
+                Log.d(TAG, "voucher payload: $payload")
                 onVoucher.invoke(payload)
             } catch (t: Throwable) {
                 Log.e(TAG, "reader loop error", t)

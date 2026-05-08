@@ -63,3 +63,24 @@ fun Voucher.Companion.fromCardJson(json: String): Voucher {
     val payload = cardJson.decodeFromString(CardVoucherPayload.serializer(), json)
     return fromCardPayload(payload)
 }
+
+/// Wire payload over NFC is a JSON ARRAY of card payloads (one or more
+/// pre-signed bearer vouchers). Tolerates the legacy single-object form too.
+fun Voucher.Companion.listFromWireJson(json: String): List<Voucher> {
+    val trimmed = json.trim()
+    return if (trimmed.startsWith("[")) {
+        val arr = cardJson.decodeFromString(
+            kotlinx.serialization.builtins.ListSerializer(CardVoucherPayload.serializer()),
+            trimmed
+        )
+        arr.map { fromCardPayload(it) }
+    } else {
+        listOf(fromCardJson(trimmed))
+    }
+}
+
+/// Build the JSON-array wire payload from a list of pre-signed cardPayload
+/// strings (the exact JSON the backend issued). Avoids re-serialization to
+/// preserve the digest-verifying byte order.
+fun cardPayloadsToWireJson(cardPayloads: List<String>): String =
+    cardPayloads.joinToString(prefix = "[", postfix = "]")

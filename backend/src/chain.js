@@ -18,6 +18,8 @@ const VAULT_ABI = [
   "function maxLockedBalance() view returns (uint256)",
   "function settleVoucher((address,address,uint256,uint256,uint256,bytes32),bytes)",
   "function settleBatch((address,address,uint256,uint256,uint256,bytes32)[],bytes[])",
+  "function settleBearer((address,address,uint256,uint256,uint256,bytes32),bytes,address)",
+  "function settleBearerBatch((address,address,uint256,uint256,uint256,bytes32)[],bytes[],address)",
   "event VoucherSettled(bytes32 indexed voucherId, address indexed payer, address indexed merchant, uint256 amount, uint256 nonce)",
   "event FundsLocked(address indexed payer, uint256 amount, uint256 newBalance)"
 ];

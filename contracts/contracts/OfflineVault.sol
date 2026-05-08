@@ -139,6 +139,54 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         require(primary != address(0), "device not authorized");
     }
 
+    /// @notice Bearer settle — pays `recipient` (not msg.sender) and skips the
+    ///         per-payer nonce monotonicity check. Used by the custodial relay
+    ///         path where one backend wallet co-signs vouchers for many users
+    ///         simultaneously: out-of-order settles by independent receivers
+    ///         would otherwise invalidate lower-nonce vouchers in flight.
+    ///         Replay protection is preserved by `usedVouchers[voucherId]`.
+    function settleBearer(Voucher calldata v, bytes calldata sig, address recipient)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        require(v.merchant == address(0), "not bearer");
+        require(recipient != address(0), "recipient=0");
+        _settleBearer(v, sig, recipient);
+    }
+
+    function settleBearerBatch(Voucher[] calldata vs, bytes[] calldata sigs, address recipient)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        require(vs.length == sigs.length, "len mismatch");
+        require(recipient != address(0), "recipient=0");
+        for (uint256 i = 0; i < vs.length; i++) {
+            require(vs[i].merchant == address(0), "not bearer");
+            _settleBearer(vs[i], sigs[i], recipient);
+        }
+    }
+
+    function _settleBearer(Voucher calldata v, bytes calldata sig, address recipient) internal {
+        require(!usedVouchers[v.voucherId], "already settled");
+        require(block.timestamp <= v.expiry, "expired");
+        require(v.amount > 0 && v.amount <= maxSinglePayment, "bad amount");
+        require(lockedBalance[v.payer] >= v.amount, "insufficient locked");
+
+        bytes32 digest = voucherDigest(v);
+        address recovered = digest.toEthSignedMessageHash().recover(sig);
+        require(recovered == v.payer, "bad signature");
+
+        usedVouchers[v.voucherId] = true;
+        // Note: NO lastNonce update. voucherId uniqueness is the sole
+        // anti-replay mechanism here.
+        lockedBalance[v.payer] -= v.amount;
+
+        require(usdc.transfer(recipient, v.amount), "payout failed");
+        emit VoucherSettled(v.voucherId, v.payer, recipient, v.amount, v.nonce);
+    }
+
     function _settle(Voucher calldata v, bytes calldata sig, address claimer) internal {
         require(!usedVouchers[v.voucherId], "already settled");
         require(block.timestamp <= v.expiry, "expired");

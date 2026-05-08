@@ -18,6 +18,27 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("dev"));
 
+// ─── RPC proxy ────────────────────────────────────────────────────────────
+// Phones talk to the laptop over USB (`adb reverse tcp:4000 tcp:4000`)
+// regardless of their own Wi-Fi/DNS state. This forwards JSON-RPC to the
+// configured upstream so SettlementClient on the phone can use
+// http://127.0.0.1:4000/rpc as its endpoint.
+app.post("/rpc", express.text({ type: "*/*", limit: "1mb" }), async (req, res) => {
+  try {
+    const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body || {});
+    const upstream = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    res.status(upstream.status);
+    res.set("content-type", upstream.headers.get("content-type") || "application/json");
+    res.send(await upstream.text());
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // ─── Health ───────────────────────────────────────────────────────────────
 app.get("/api/health", async (_req, res) => {
   let blockNumber = null;
@@ -152,6 +173,142 @@ app.post("/api/vouchers/issue", async (req, res) => {
     }
     res.json({ ok: true, vouchers: issued });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Wallet (Option A custodial) — atomic topup that mints, locks, pre-signs ────
+// One-shot endpoint the unified wallet app calls. Returns N pre-signed bearer
+// vouchers totaling the requested amount. Phone stores them locally and emits
+// one or more on each NFC tap. Backend remains custodian until vouchers settle.
+//
+// Body: { address, amountUsdc, denomUsdc?, count? }
+//   denomUsdc * count == amountUsdc; defaults give 5 equal pieces.
+//
+// Each voucher: payer = backend.address, merchant = 0x0 (bearer), nonce
+// strictly increasing per-backend (mutex-serialized below). Replay safety
+// is voucherId-only — see OfflineVault.settleBearer for why nonce is not
+// enforced on the bearer settle path.
+let chainOpQueue = Promise.resolve();
+function withChainLock(fn) {
+  const next = chainOpQueue.then(fn, fn);
+  // Don't propagate failures into the queue chain.
+  chainOpQueue = next.catch(() => null);
+  return next;
+}
+
+app.post("/api/wallet/topup", async (req, res) => {
+  if (!vault || !usdc) return res.status(503).json({ error: "chain not configured" });
+  try {
+    const { address, amountUsdc, denomUsdc, count } = req.body || {};
+    if (!ethers.isAddress(address)) return res.status(400).json({ error: "bad address" });
+    const total = BigInt(amountUsdc || 1_000_000); // default $1
+    if (total <= 0n || total > 100_000_000n) return res.status(400).json({ error: "amount out of range" });
+
+    const n = Number.isInteger(count) && count > 0 && count <= 50 ? count : 5;
+    const denom = denomUsdc ? BigInt(denomUsdc) : (total / BigInt(n));
+    if (denom * BigInt(n) !== total) return res.status(400).json({ error: "denom*count must equal amount" });
+
+    const result = await withChainLock(async () => {
+      // Mint mUSDC to backend, lock in vault. Approve only the marginal amount.
+      await (await usdc.mint(signer.address, total)).wait();
+      await (await usdc.approve(config.vault, total)).wait();
+      await (await vault.lockFunds(total)).wait();
+
+      // Allocate contiguous nonces above whatever the chain has settled so far.
+      // This is a strictly-monotonic upper bound; bearer settle ignores nonce
+      // anyway, so we just need uniqueness across in-flight vouchers.
+      let nonce = Number(await vault.lastNonce(signer.address));
+      const issued = [];
+      for (let i = 0; i < n; i++) {
+        nonce += 1;
+        const voucher = buildVoucher({
+          payer: signer.address,
+          merchant: ethers.ZeroAddress,
+          amountUsdc: denom,
+          ttlSeconds: 24 * 3600,
+          nonce
+        });
+        const signature = await signVoucher(signer, voucher);
+
+        db.prepare(
+          "INSERT INTO vouchers (voucher_id, payer, merchant, amount, expiry, nonce, signature, status, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?)"
+        ).run(voucher.voucherId, voucher.payer.toLowerCase(),
+              voucher.merchant.toLowerCase(), voucher.amount.toString(),
+              Number(voucher.expiry), Number(voucher.nonce),
+              signature, Date.now());
+
+        issued.push({
+          voucher: {
+            payer: voucher.payer, merchant: voucher.merchant,
+            amount: voucher.amount.toString(),
+            expiry: Number(voucher.expiry), nonce: Number(voucher.nonce),
+            voucherId: voucher.voucherId
+          },
+          signature,
+          cardPayload: voucherToCardJson(voucher, signature)
+        });
+      }
+      return issued;
+    });
+
+    res.json({ ok: true, owner: address.toLowerCase(),
+               amountUsdc: total.toString(), vouchers: result });
+  } catch (e) {
+    console.error("/api/wallet/topup", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Receiver pushes received vouchers; backend settles on-chain to recipient ───
+// Body: { recipient, vouchers: [{ voucher, signature }] }
+// Response: { ok, settled: N, tx: '0x…', rejected: [{voucherId, reason}] }
+app.post("/api/wallet/redeem", async (req, res) => {
+  if (!vault) return res.status(503).json({ error: "chain not configured" });
+  try {
+    const { recipient, vouchers } = req.body || {};
+    if (!ethers.isAddress(recipient)) return res.status(400).json({ error: "bad recipient" });
+    if (!Array.isArray(vouchers) || vouchers.length === 0)
+      return res.status(400).json({ error: "vouchers[] required" });
+
+    // Pre-validate signatures + dedupe before paying gas.
+    const ok = [], rejected = [];
+    for (const item of vouchers) {
+      const v = item.voucher;
+      try {
+        if (v.merchant && v.merchant.toLowerCase() !== ethers.ZeroAddress.toLowerCase())
+          throw new Error("not bearer");
+        const recovered = recoverVoucherSigner(v, item.signature);
+        if (recovered.toLowerCase() !== v.payer.toLowerCase()) throw new Error("bad sig");
+        const existing = db.prepare("SELECT status FROM vouchers WHERE voucher_id=?").get(v.voucherId);
+        if (existing && existing.status === "settled") throw new Error("already settled");
+        ok.push(item);
+      } catch (e) {
+        rejected.push({ voucherId: v.voucherId, reason: e.message });
+      }
+    }
+    if (!ok.length) return res.json({ ok: true, settled: 0, rejected });
+
+    const result = await withChainLock(async () => {
+      const vs = ok.map(it => [
+        it.voucher.payer, it.voucher.merchant,
+        BigInt(it.voucher.amount), BigInt(it.voucher.expiry),
+        BigInt(it.voucher.nonce), it.voucher.voucherId
+      ]);
+      const sigs = ok.map(it => it.signature);
+      const tx = await vault.settleBearerBatch(vs, sigs, recipient);
+      const rcpt = await tx.wait();
+      for (const it of ok) {
+        db.prepare(
+          "UPDATE vouchers SET status='settled', settled_tx=?, redeemed_at=? WHERE voucher_id=?"
+        ).run(rcpt.hash, Date.now(), it.voucher.voucherId);
+      }
+      return rcpt.hash;
+    });
+
+    res.json({ ok: true, settled: ok.length, tx: result, rejected });
+  } catch (e) {
+    console.error("/api/wallet/redeem", e);
     res.status(500).json({ error: e.message });
   }
 });

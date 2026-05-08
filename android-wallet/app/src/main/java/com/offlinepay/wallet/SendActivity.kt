@@ -5,62 +5,86 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import java.math.BigInteger
 
 class SendActivity : AppCompatActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
+        val unspent = UnspentStore(this)
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 96, 48, 48)
         }
-        val amountView = EditText(this).apply { hint = "amount in USDC (e.g. 1.50)"; setText("1.00") }
+        val balanceLbl = TextView(this).apply { textSize = 14f }
+        val amountView = EditText(this).apply { hint = "amount in USDC (e.g. 0.50)"; setText("0.50") }
         val payBtn  = Button(this).apply { text = "Arm payment (HCE on)" }
         val qrBtn   = Button(this).apply { text = "Show QR instead" }
         val status  = TextView(this).apply { text = "ready"; textSize = 14f }
         val qrImg   = ImageView(this)
+        val hint = TextView(this).apply {
+            text = "Vouchers were pre-signed by backend at topup. NFC tap emits one or\n" +
+                   "more matching the entered amount. No internet needed at tap time."
+            textSize = 12f; setTextColor(0xFF6E7280.toInt()); setPadding(0, 24, 0, 0)
+        }
 
-        listOf(amountView, payBtn, qrBtn, status, qrImg).forEach { root.addView(it) }
+        listOf(balanceLbl, amountView, payBtn, qrBtn, status, qrImg, hint).forEach { root.addView(it) }
         setContentView(root)
+
+        lifecycleScope.launch {
+            unspent.unspentTotalFlow().collectLatest { totalBase ->
+                balanceLbl.text = "spendable: ${"%.2f".format(totalBase.toDouble() / 1e6)} USDC"
+            }
+        }
 
         payBtn.setOnClickListener {
             val baseUnits = parseUsdc(amountView.text.toString()) ?: run {
                 status.text = "bad amount"; return@setOnClickListener
             }
-            PendingPayment.arm(baseUnits)
-            status.text = "armed for ${amountView.text} USDC — hold near receiver"
-            // Surface async errors from the HCE service.
             lifecycleScope.launch {
-                while (PendingPayment.isArmed()) delay(200)
-                val err = PendingPayment.pollError()
-                status.text = if (err != null) "✗ $err" else "✓ paid ${amountView.text} USDC"
+                val pick = unspent.pickForExactAmount(baseUnits) ?: run {
+                    status.text = "✗ can't make ${amountView.text} from current denominations — topup more"
+                    return@launch
+                }
+                val payload = cardPayloadsToWireJson(pick.map { it.cardPayload })
+                val ids = pick.map { it.voucherId }
+                PendingPayment.arm(this@SendActivity, payload, ids)
+                status.text = "armed ${pick.size} voucher(s) totaling ${amountView.text} USDC — hold near receiver"
+
+                // Wait for HCE to consume + report spent ids.
+                while (PendingPayment.isArmed(this@SendActivity)) delay(200)
+                val err = PendingPayment.pollError(this@SendActivity)
+                if (err != null) {
+                    status.text = "✗ $err"
+                } else {
+                    val spent = PendingPayment.pollSpent(this@SendActivity)
+                    if (spent.isNotEmpty()) unspent.markSpent(spent)
+                    status.text = "✓ paid ${amountView.text} USDC"
+                }
             }
         }
 
         qrBtn.setOnClickListener {
-            // Sender QR path: needs receiver's address first. For MVP keep simple —
-            // require user to paste receiver address into amountView's helper later.
-            // Here we just sign with merchant=0 (bearer) for the QR demo.
             val baseUnits = parseUsdc(amountView.text.toString()) ?: run {
                 status.text = "bad amount"; return@setOnClickListener
             }
-            val keyVault = KeyVault(this)
-            val nonces = NonceTracker(this)
-            val signer = VoucherSigner(
-                Config.CHAIN_ID, Config.VAULT_ADDRESS,
-                keyVault.keyPair, keyVault.address, nonces
-            )
-            val signed = signer.signNext(merchant = null, amountUsdc = baseUnits, ttlSeconds = Config.DEFAULT_TTL_SECONDS)
-            qrImg.setImageBitmap(Qr.render(signed.toCardJson()))
-            status.text = "QR rendered (bearer voucher; receiver scans)"
+            lifecycleScope.launch {
+                val pick = unspent.pickForExactAmount(baseUnits) ?: run {
+                    status.text = "✗ can't make ${amountView.text}"; return@launch
+                }
+                val payload = cardPayloadsToWireJson(pick.map { it.cardPayload })
+                qrImg.setImageBitmap(Qr.render(payload))
+                unspent.markSpent(pick.map { it.voucherId })
+                status.text = "QR rendered — receiver scans (vouchers marked spent)"
+            }
         }
     }
 
-    private fun parseUsdc(text: String): BigInteger? = try {
+    private fun parseUsdc(text: String): Long? = try {
         val parts = text.trim().split(".")
         val whole = parts[0].toLong()
         val frac = parts.getOrNull(1)?.padEnd(6, '0')?.take(6)?.toLong() ?: 0L
-        BigInteger.valueOf(whole * 1_000_000 + frac)
+        whole * 1_000_000 + frac
     } catch (_: Throwable) { null }
 }
