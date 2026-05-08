@@ -12,8 +12,9 @@ object Config {
     // RPC for direct settle. Public Amoy RPC works for the demo.
     const val RPC_URL        = "https://rpc-amoy.polygon.technology"
 
-    // Backend (faucet + key backup). LAN IP so phones can reach the laptop.
-    const val BACKEND_BASE   = "http://192.168.127.31:4000"
+    // Backend reachable via `adb reverse tcp:4000 tcp:4000` (USB tunnel).
+    // For LAN testing replace with the laptop's IPv4, e.g. http://192.168.x.x:4000.
+    const val BACKEND_BASE   = "http://127.0.0.1:4000"
 
     val MAX_SINGLE_USDC: BigInteger = BigInteger("2000000")  // $2.00, matches contract
     const val DEFAULT_TTL_SECONDS    = 24L * 3600
