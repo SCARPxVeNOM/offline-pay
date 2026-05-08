@@ -1,6 +1,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 function loadDeployment() {
   // Auto-discover the most recent deployment if env vars aren't set.
@@ -25,6 +26,18 @@ export const config = {
   backendKey: process.env.BACKEND_PRIVATE_KEY ||
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
   dbPath: process.env.DB_PATH || "./data/offlinepay.db",
+  // Server secret for the keybackup pepper. Derive a stable per-user salt
+  // so a blob dump alone is useless without server cooperation. A random
+  // dev fallback is generated and persisted in `data/.pepper` on first run;
+  // PRODUCTION must set KEYBACKUP_PEPPER_SECRET via env.
+  keybackupPepperSecret: process.env.KEYBACKUP_PEPPER_SECRET || (() => {
+    const p = path.resolve(path.dirname(process.env.DB_PATH || "./data/offlinepay.db"), ".pepper");
+    if (fs.existsSync(p)) return fs.readFileSync(p, "utf8").trim();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const v = crypto.randomBytes(32).toString("hex");
+    fs.writeFileSync(p, v);
+    return v;
+  })(),
 };
 
 if (!config.vault || !config.usdc) {

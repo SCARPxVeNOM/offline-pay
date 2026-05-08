@@ -8,6 +8,10 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+interface IMerchantRegistry {
+    function resolveDevice(address device) external view returns (bytes32 id, address primary);
+}
+
 /// @title OfflineVault — settlement layer for OfflinePay vouchers.
 /// @notice Customers lock USDC, sign offline vouchers (bearer or fixed-merchant),
 ///         and merchants redeem them on-chain when they reconnect.
@@ -16,6 +20,11 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
     using MessageHashUtils for bytes32;
 
     IERC20 public immutable usdc;
+
+    /// @notice Optional merchant registry. When set, callers of
+    ///         `settleVoucherAsDevice` are treated as device keys and the
+    ///         payout goes to their merchant's primary wallet.
+    IMerchantRegistry public merchantRegistry;
 
     // Hard caps to bound offline double-spend exposure.
     uint256 public maxSinglePayment   = 2_000_000;      // $2.00 (USDC has 6 decimals)
@@ -36,6 +45,7 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         uint256 nonce
     );
     event LimitsUpdated(uint256 maxSingle, uint256 maxBalance, uint256 ttl);
+    event MerchantRegistryUpdated(address indexed registry);
 
     struct Voucher {
         address payer;       // funds owner
@@ -96,6 +106,39 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         }
     }
 
+    /// @notice Settle a voucher claimed by an authorized device key.
+    /// @dev    msg.sender is a device (phone/ESP32). The registry resolves it
+    ///         to the merchant's primary wallet, which receives the funds.
+    ///         The voucher's `merchant` field must equal the primary wallet
+    ///         (or be address(0) for bearer).
+    function settleVoucherAsDevice(Voucher calldata v, bytes calldata sig)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        address primary = _resolvePrimary(msg.sender);
+        _settle(v, sig, primary);
+    }
+
+    /// @notice Batch device-keyed settlement.
+    function settleBatchAsDevice(Voucher[] calldata vs, bytes[] calldata sigs)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        require(vs.length == sigs.length, "len mismatch");
+        address primary = _resolvePrimary(msg.sender);
+        for (uint256 i = 0; i < vs.length; i++) {
+            _settle(vs[i], sigs[i], primary);
+        }
+    }
+
+    function _resolvePrimary(address device) internal view returns (address primary) {
+        require(address(merchantRegistry) != address(0), "registry unset");
+        (, primary) = merchantRegistry.resolveDevice(device);
+        require(primary != address(0), "device not authorized");
+    }
+
     function _settle(Voucher calldata v, bytes calldata sig, address claimer) internal {
         require(!usedVouchers[v.voucherId], "already settled");
         require(block.timestamp <= v.expiry, "expired");
@@ -138,6 +181,11 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
     }
 
     // ─── Admin ──────────────────────────────────────────────────────
+
+    function setMerchantRegistry(address registry) external onlyOwner {
+        merchantRegistry = IMerchantRegistry(registry);
+        emit MerchantRegistryUpdated(registry);
+    }
 
     function setLimits(uint256 _maxSingle, uint256 _maxBalance, uint256 _ttl) external onlyOwner {
         maxSinglePayment  = _maxSingle;

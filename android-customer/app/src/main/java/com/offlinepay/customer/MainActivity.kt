@@ -1,5 +1,6 @@
 package com.offlinepay.customer
 
+import android.content.Intent
 import android.os.Bundle
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
@@ -42,7 +43,33 @@ class MainActivity : AppCompatActivity() {
                    "Each tap drains one voucher from the queue."
             setPadding(0, 24, 0, 0); textSize = 12f; setTextColor(0xFF6E7280.toInt())
         }
-        listOf(addressView, topupAmount, topupBtn, issueCount, issueBtn, queueView, tapHint)
+
+        // Backup banner — only shown if the user has never backed up. Tap
+        // opens BackupRestoreActivity. Without a backup, a lost phone =
+        // permanently inaccessible USDC, so we nudge prominently.
+        val keyPrefs = getSharedPreferences("offlinepay_keys", MODE_PRIVATE)
+        val backupBanner = TextView(this).apply {
+            text = "⚠ Tap here to back up your wallet — funds at risk if you lose this phone"
+            textSize = 13f
+            setPadding(24, 24, 24, 24)
+            setBackgroundColor(0xFFFFF4D6.toInt())
+            setTextColor(0xFF7A4F00.toInt())
+            visibility = if (keyPrefs.getLong(BackupRestoreActivity.KEY_LAST_BACKUP_TS, 0L) == 0L)
+                            android.view.View.VISIBLE
+                        else android.view.View.GONE
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, BackupRestoreActivity::class.java))
+            }
+        }
+        val openBackup = Button(this).apply {
+            text = "Wallet backup / restore"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, BackupRestoreActivity::class.java))
+            }
+        }
+
+        listOf(backupBanner, addressView, topupAmount, topupBtn, issueCount, issueBtn,
+               queueView, tapHint, openBackup)
             .forEach { root.addView(it) }
         setContentView(root)
 

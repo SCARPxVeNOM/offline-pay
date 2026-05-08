@@ -30,6 +30,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var store: VoucherStore
     private lateinit var verifier: VoucherVerifier
     private lateinit var bt: BluetoothBridge
+    private lateinit var mesh: MeshBroadcaster
     private val client by lazy { SettlementClient(BACKEND_BASE_URL) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,9 +52,35 @@ class MainActivity : AppCompatActivity() {
         store    = VoucherStore(this)
         verifier = VoucherVerifier(CHAIN_ID, VAULT_ADDRESS, MAX_SINGLE_USDC, store)
         bt       = BluetoothBridge(this, scope = lifecycleScope)
+        // This phone's own EVM keypair. Its address must be authorized in
+        // MerchantRegistry via authorizeDevice() so peers (and the vault)
+        // recognize it during handshake and on-chain settlement.
+        val keyVault = MerchantKeyVault(this)
+
+        // Sybil gate: only count ACKs from peers whose device address is
+        // present in the local registry cache. Production fills this from
+        // a periodic MerchantRegistry RPC poll; for the demo we leave the
+        // allowlist empty + the gate accepts nothing (handshake will fail
+        // closed). Adjust to `{ true }` to run in trust-all dev mode.
+        val allowedDevices = mutableSetOf<String>()
+        val registryGate: (String) -> Boolean = { addr ->
+            allowedDevices.contains(addr.lowercase())
+        }
+        val hsManager = HandshakeManager(
+            keyPair = keyVault.keyPair,
+            selfAddress = keyVault.address,
+            isRegisteredDevice = registryGate,
+        )
+        mesh = MeshBroadcaster(
+            ctx = this, store = store, verifier = verifier,
+            deviceId = keyVault.address,
+            isRegisteredDevice = registryGate,
+            handshake = hsManager,
+        ).also { it.selfAddress = keyVault.address }
 
         ensurePermissions()
         bt.connect()
+        mesh.start()
 
         // Stream vouchers from the ESP32, verify, persist, ack.
         lifecycleScope.launch {
@@ -61,6 +88,7 @@ class MainActivity : AppCompatActivity() {
                 val result = verifier.verify(v)
                 if (result == VerifyResult.VALID) {
                     store.saveAccepted(v)
+                    mesh.broadcast(v)  // replicate across nearby peers
                     bt.sendDecision(true)
                     setStatus("✅ ${"%.2f".format(v.amount.toDouble() / 1e6)} USDC accepted (id ${v.voucherId.take(10)}…)")
                 } else {
@@ -75,9 +103,12 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             store.recent().collectLatest { rows ->
                 feed.text = rows.joinToString("\n") { r ->
-                    val st = when (r.status) { "accepted" -> "✓"; "settled" -> "⛓"; else -> "✗" }
+                    val st = when (r.status) {
+                        "accepted" -> "✓"; "settled" -> "⛓"; "replica" -> "↻"; else -> "✗"
+                    }
                     val amt = "%.2f".format(BigInteger(r.amount).toDouble() / 1e6)
-                    "$st $amt  ${r.voucherId.take(10)}…  ${r.status}"
+                    val backup = if (r.status == "accepted") "  [${confidenceLevel(r.replicaCount)}]" else ""
+                    "$st $amt  ${r.voucherId.take(10)}…  ${r.status}$backup"
                 }
             }
         }
@@ -85,10 +116,20 @@ class MainActivity : AppCompatActivity() {
         settleBtn.setOnClickListener {
             lifecycleScope.launch {
                 val pending = store.pendingForSettle()
-                setStatus("settling ${pending.size}…")
-                val resp = client.redeemAndSettle(pending)
+                setStatus("claiming ${pending.size}…")
+                // Claim-before-settle: announce intent on the mesh and drop
+                // any voucher a peer has claimed first. This stops two
+                // backups racing on-chain and burning gas on revert.
+                val toSettle = pending.filter { mesh.claimAndWait(it.voucherId) }
+                val skipped = pending.size - toSettle.size
+                if (toSettle.isEmpty()) {
+                    setStatus("all ${pending.size} claimed by peers — backing off")
+                    return@launch
+                }
+                setStatus("settling ${toSettle.size} (skipped $skipped claimed by peers)…")
+                val resp = client.redeemAndSettle(toSettle)
                 if (resp.settled > 0 && resp.tx != null) {
-                    pending.forEach { store.markSettled(it.voucherId, resp.tx!!) }
+                    toSettle.forEach { store.markSettled(it.voucherId, resp.tx!!) }
                     setStatus("⛓ settled ${resp.settled} on chain — tx ${resp.tx!!.take(10)}…")
                 } else {
                     setStatus("settle response: ${resp.error ?: "no rows"}")
@@ -117,5 +158,5 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { /* ignored — connect() will retry once user grants */ }
 
-    override fun onDestroy() { bt.close(); super.onDestroy() }
+    override fun onDestroy() { mesh.stop(); bt.close(); super.onDestroy() }
 }

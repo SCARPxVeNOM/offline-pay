@@ -27,11 +27,21 @@ async function main() {
   const vaultAddr = await vault.getAddress();
   console.log("OfflineVault:", vaultAddr);
 
+  const Registry = await ethers.getContractFactory("MerchantRegistry");
+  const registry = await Registry.deploy();
+  await registry.waitForDeployment();
+  const registryAddr = await registry.getAddress();
+  console.log("MerchantRegistry:", registryAddr);
+
+  await (await vault.setMerchantRegistry(registryAddr)).wait();
+  console.log("Vault → registry wired");
+
   const out = {
     network: network.name,
     chainId: Number((await ethers.provider.getNetwork()).chainId),
     usdc: usdcAddr,
     vault: vaultAddr,
+    registry: registryAddr,
     deployer: deployer.address,
     deployedAt: new Date().toISOString()
   };

@@ -14,11 +14,18 @@ import java.security.SecureRandom
 /// Builds and signs vouchers locally using the customer's secp256k1 key.
 /// Output is byte-compatible with backend/src/voucher.js and on-chain
 /// `OfflineVault.voucherDigest`.
+///
+/// Production callers MUST use [signNext] so every voucher draws its nonce
+/// from the single persisted [NonceTracker] — re-using a nonce is what
+/// causes the "stale nonce" revert on the second-to-settle voucher. The
+/// raw [sign] entrypoint is kept for tests and the legacy custodial path
+/// where the backend manages the nonce.
 class VoucherSigner(
     private val chainId: Long,
     private val vaultAddress: String,
     private val keyPair: ECKeyPair,
     private val payerAddress: String,
+    private val nonces: NonceTracker? = null,
 ) {
     data class SignedVoucher(
         val payer: String, val merchant: String,
@@ -26,6 +33,20 @@ class VoucherSigner(
         val voucherId: String, val signature: String
     )
 
+    /// THE ONE call site for locally-signed vouchers in this app. Allocates
+    /// the next nonce atomically (commit-backed) and never re-derives from
+    /// getLast() afterwards.
+    fun signNext(
+        merchant: String?,
+        amountUsdc: BigInteger,
+        ttlSeconds: Long,
+    ): SignedVoucher {
+        val tracker = nonces
+            ?: error("VoucherSigner constructed without NonceTracker — refuse to sign")
+        return sign(merchant, amountUsdc, ttlSeconds, tracker.next())
+    }
+
+    /// Test/legacy entrypoint. Production code must call [signNext] instead.
     fun sign(
         merchant: String?,
         amountUsdc: BigInteger,

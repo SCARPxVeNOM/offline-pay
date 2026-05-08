@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
+import crypto from "node:crypto";
+import rateLimit from "express-rate-limit";
 import { ethers } from "ethers";
 import { config } from "./config.js";
 import { db } from "./db.js";
@@ -215,6 +217,65 @@ app.post("/api/merchant/settle", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─── Pepper for keybackup (anti-brute-force on blob leaks) ───────────────
+// HMAC(serverSecret, userId) → per-user pepper. A blob dump alone is
+// useless without this value, and computing it requires the server secret.
+// In production this should be rate-limited per IP/userId and audited.
+function pepperFor(userId) {
+  return crypto.createHmac("sha256", config.keybackupPepperSecret)
+               .update(String(userId)).digest("base64");
+}
+
+// 5 attempts per 15-min window per (IP, userId). Without this, an attacker
+// who has dumped the keybackups table could enumerate userIds and harvest
+// peppers to mount offline brute-force on each blob.
+const pepperLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `${req.ip}:${req.params.userId}`,
+  handler: (_req, res) => res.status(429).json({ error: "too many attempts" }),
+});
+
+app.get("/api/keybackup/pepper/:userId", pepperLimiter, (req, res) => {
+  if (!req.params.userId || req.params.userId.length > 256) {
+    return res.status(400).json({ error: "bad userId" });
+  }
+  res.json({ userId: req.params.userId, pepperB64: pepperFor(req.params.userId) });
+});
+
+// ─── Encrypted key backup (customer recovery) ────────────────────────────
+// The backend stores OPAQUE ciphertext keyed by userId. The plaintext private
+// key never leaves the customer's device — only AES-GCM ciphertext under a
+// PBKDF2 key derived from the user's passphrase. So a backend compromise
+// leaks neither funds nor identity.
+app.post("/api/keybackup", (req, res) => {
+  const b = req.body || {};
+  const need = ["userId", "address", "saltB64", "ivB64", "ciphertextB64", "iterations"];
+  for (const k of need) if (b[k] == null) return res.status(400).json({ error: `missing ${k}` });
+  if (!ethers.isAddress(b.address)) return res.status(400).json({ error: "bad address" });
+  if (!Number.isInteger(b.iterations) || b.iterations < 100_000) {
+    return res.status(400).json({ error: "iterations too low" });
+  }
+  // Cap blob size to prevent abuse.
+  if (b.ciphertextB64.length > 4096 || b.saltB64.length > 64 || b.ivB64.length > 64) {
+    return res.status(400).json({ error: "blob too large" });
+  }
+  db.prepare(
+    "INSERT OR REPLACE INTO keybackups (user_id, address, salt_b64, iv_b64, ciphertext_b64, iterations, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run(b.userId, b.address.toLowerCase(), b.saltB64, b.ivB64, b.ciphertextB64, b.iterations, Date.now());
+  res.json({ ok: true });
+});
+
+app.get("/api/keybackup/:userId", (req, res) => {
+  const row = db.prepare(
+    "SELECT user_id as userId, address, salt_b64 as saltB64, iv_b64 as ivB64, ciphertext_b64 as ciphertextB64, iterations FROM keybackups WHERE user_id = ?"
+  ).get(req.params.userId);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
 });
 
 // ─── Read-only stats for the judge dashboard ─────────────────────────────

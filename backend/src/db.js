@@ -32,6 +32,16 @@ CREATE INDEX IF NOT EXISTS idx_vouchers_payer    ON vouchers(payer);
 CREATE INDEX IF NOT EXISTS idx_vouchers_merchant ON vouchers(merchant);
 CREATE INDEX IF NOT EXISTS idx_vouchers_status   ON vouchers(status);
 
+CREATE TABLE IF NOT EXISTS keybackups (
+  user_id        TEXT PRIMARY KEY,
+  address        TEXT NOT NULL,
+  salt_b64       TEXT NOT NULL,
+  iv_b64         TEXT NOT NULL,
+  ciphertext_b64 TEXT NOT NULL,
+  iterations     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS topups (
   id TEXT PRIMARY KEY,
   customer TEXT NOT NULL,

@@ -55,4 +55,9 @@ dependencies {
     // HTTP for settle requests (we proxy through the OfflinePay backend so
     // the merchant phone doesn't have to hold an Ethereum wallet).
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Nearby Connections — BLE + WiFi-Direct mesh used to replicate vouchers
+    // across nearby merchant phones / customer phones / ESP32 gateways so
+    // losing one device doesn't destroy unsettled vouchers.
+    implementation("com.google.android.gms:play-services-nearby:19.3.0")
 }

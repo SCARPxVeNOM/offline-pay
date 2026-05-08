@@ -29,6 +29,7 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <BluetoothSerial.h>
+#include "wallet.h"
 
 #define SS_PIN     5
 #define RST_PIN    22
@@ -75,6 +76,12 @@ void setup() {
     Serial.println("[BT] OfflinePay_Reader online");
   }
 
+  // Provision (or load) this device's secp256k1 wallet. Address must be
+  // registered on MerchantRegistry via authorizeDevice() before settlement.
+  if (!OfflinePayWallet::begin()) {
+    Serial.println("[wallet] init FAILED — settlement disabled");
+  }
+
   Serial.println("[RC522] reader ready, waiting for card...");
   showReady();
 }
@@ -96,8 +103,12 @@ void loop() {
 
   Serial.println(String("[CARD] voucher=") + voucherJson);
 
-  // Forward to merchant phone, prefixed with the UID for traceability.
+  // Forward to merchant phone, prefixed with the UID and this reader's
+  // device address (so the merchant phone can sanity-check that the reader
+  // is one of its authorized devices).
   SerialBT.print("VOUCHER ");
+  SerialBT.print(OfflinePayWallet::address());
+  SerialBT.print(" ");
   SerialBT.print(uid);
   SerialBT.print(" ");
   SerialBT.println(voucherJson);

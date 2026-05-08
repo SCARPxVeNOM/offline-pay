@@ -68,13 +68,19 @@ class BluetoothBridge(
     fun close() { try { socket?.close() } catch (_: Exception) {} }
 
     private fun parseFrame(line: String): Voucher? {
-        // Reader prints: VOUCHER <uid> <json>
+        // Reader prints either:
+        //   VOUCHER <uid> <json>                     (legacy)
+        //   VOUCHER <deviceAddr> <uid> <json>        (current — addr starts 0x)
         return try {
             val trimmed = line.trim()
             if (!trimmed.startsWith("VOUCHER ")) return null
-            val parts = trimmed.split(" ", limit = 3)
-            if (parts.size < 3) return null
-            val payload = json.decodeFromString(CardVoucherPayload.serializer(), parts[2])
+            val parts = trimmed.split(" ", limit = 4)
+            val jsonText = when {
+                parts.size == 4 && parts[1].startsWith("0x") -> parts[3]
+                parts.size >= 3                              -> parts[2]
+                else                                         -> return null
+            }
+            val payload = json.decodeFromString(CardVoucherPayload.serializer(), jsonText)
             Voucher.fromCardPayload(payload)
         } catch (e: Exception) {
             Log.e(TAG, "bad frame: $line", e); null

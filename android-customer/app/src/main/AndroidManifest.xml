@@ -24,6 +24,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".BackupRestoreActivity"
+            android:exported="false"
+            android:label="Wallet backup" />
+
         <service
             android:name=".HceVoucherService"
             android:exported="true"
