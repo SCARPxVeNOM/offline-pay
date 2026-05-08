@@ -255,6 +255,17 @@ app.post("/api/faucet", faucetLimiter, async (req, res) => {
     if (!ethers.isAddress(address)) return res.status(400).json({ error: "bad address" });
     const amt = BigInt(amountUsdc || 5_000_000); // default $5
     if (amt <= 0n || amt > 100_000_000n) return res.status(400).json({ error: "amount out of range" });
+
+    // First-time funding: top up gas if balance is below the demo threshold.
+    // 0.05 MATIC covers ~50 settle/lock txs at typical Amoy gas prices.
+    const gasFloor = ethers.parseEther("0.02");
+    const gasTopup = ethers.parseEther("0.05");
+    const balance  = await provider.getBalance(address);
+    if (balance < gasFloor) {
+      const gasTx = await signer.sendTransaction({ to: address, value: gasTopup });
+      await gasTx.wait();
+    }
+
     const tx = await usdc.mint(address, amt);
     const rcpt = await tx.wait();
     res.json({ ok: true, tx: rcpt.hash, amountUsdc: amt.toString() });
