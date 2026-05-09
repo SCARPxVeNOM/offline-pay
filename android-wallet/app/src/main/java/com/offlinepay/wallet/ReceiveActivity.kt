@@ -391,6 +391,16 @@ class ReceiveActivity : ComponentActivity() {
                 activity.recordFailed("Bearer voucher needs reader-tap to settle")
             }
             for (row in endorsed) {
+                val reason = settle.preflightBearerWithEndorsement(row)
+                if (reason != null) {
+                    Log.w(TAG, "preflight rejected ${row.voucherId.take(10)}: $reason")
+                    store.markRejected(row.voucherId, "PREFLIGHT_FAIL")
+                    activity.recordFailed("Settle would revert: $reason")
+                    state.value = state.value.copy(
+                        status = "blocked: $reason",
+                        statusKind = StatusKind.Error)
+                    continue
+                }
                 val tx = settle.settleBearerWithEndorsement(row)
                 store.markSettled(row.voucherId, tx)
                 WalletMesh.broadcastSettled(row.voucherId, tx)

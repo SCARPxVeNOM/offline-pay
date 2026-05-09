@@ -87,6 +87,42 @@ class SettlementClient(
             txHash
         }
 
+    /// Pre-flight via eth_call: returns null if the call would succeed,
+    /// otherwise a human-friendly revert reason. Saves gas on guaranteed-
+    /// to-fail submissions and surfaces a precise diagnosis instead of
+    /// "settle reverted on chain: 0x…".
+    suspend fun preflightBearerWithEndorsement(row: VoucherRow): String? =
+        withContext(Dispatchers.IO) {
+            val device  = row.endorsementDevice  ?: return@withContext "missing endorsement device"
+            val primary = row.endorsementPrimary ?: return@withContext "missing endorsement primary"
+            val ts      = row.endorsementTs      ?: return@withContext "missing endorsement timestamp"
+            val esig    = row.endorsementSig     ?: return@withContext "missing endorsement signature"
+            val voucher  = voucherTuple(row)
+            val function = Function(
+                "settleBearerWithEndorsement",
+                listOf(
+                    voucher,
+                    DynamicBytes(Numeric.hexStringToByteArray(row.signature)),
+                    Address(device),
+                    Address(primary),
+                    Uint256(BigInteger.valueOf(ts)),
+                    DynamicBytes(Numeric.hexStringToByteArray(esig)),
+                ),
+                emptyList()
+            )
+            val data = FunctionEncoder.encode(function)
+            val resp = web3.ethCall(
+                org.web3j.protocol.core.methods.request.Transaction.createEthCallTransaction(
+                    fromAddress, vaultAddress, data
+                ),
+                org.web3j.protocol.core.DefaultBlockParameterName.LATEST,
+            ).send()
+            if (resp.hasError()) {
+                val data4 = resp.error?.data?.toString()
+                decodeRevertReason(resp.error?.message ?: "eth_call reverted", data4)
+            } else null
+        }
+
     /// True-bearer settle, paid out to the merchant primary committed by
     /// the ESP32 endorsement. Used for B2 cards where recipient = 0x0
     /// and the merchant binding only happens at tap time.
@@ -288,5 +324,33 @@ class SettlementClient(
         val resp = web3.ethSendRawTransaction(Numeric.toHexString(signed)).send()
         if (resp.hasError()) error("write failed: ${resp.error.message}")
         resp.transactionHash
+    }
+
+    /// Translate raw RPC error / revert data into a one-line user-friendly
+    /// reason. Handles plain message reverts (Error(string) selector
+    /// 0x08c379a0), OZ ECDSA's custom errors, and the contract's own
+    /// require strings. Falls back to the raw message for anything else.
+    private fun decodeRevertReason(message: String, errData: String?): String {
+        // Solidity `revert("...")` ABI-encodes as Error(string):
+        //   0x08c379a0 + 32-byte offset + 32-byte length + bytes(string).
+        if (errData != null && errData.startsWith("0x08c379a0") && errData.length > 138) {
+            return try {
+                val lenHex = errData.substring(74, 138)
+                val len = BigInteger(lenHex, 16).toInt().coerceAtMost(200)
+                val strHex = errData.substring(138, 138 + len * 2)
+                val bytes = Numeric.hexStringToByteArray(strHex)
+                String(bytes).trim()
+            } catch (_: Throwable) { message }
+        }
+        // Custom errors: 4-byte selector + ABI-encoded args.
+        if (errData != null && errData.length >= 10) {
+            return when (errData.substring(0, 10)) {
+                "0xd78bce0c" -> "endorsement signature has high s (firmware bug — re-tap)"
+                "0xfb8f41b2" -> "ECDSA recover error (bad endorsement)"
+                "0xf645eedf" -> "ECDSA invalid signature length"
+                else -> message
+            }
+        }
+        return message
     }
 }

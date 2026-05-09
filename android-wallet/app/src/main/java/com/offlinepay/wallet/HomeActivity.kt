@@ -400,6 +400,18 @@ class HomeActivity : ComponentActivity() {
                 activity.recordFailed("Bearer voucher needs reader-tap to settle")
             }
             for (row in endorsed) {
+                // Dry-run the call first. If the contract would revert, we
+                // get the precise reason from eth_call without spending any
+                // gas. Surface it in the activity feed and quarantine the
+                // row so we don't loop on the same bad input.
+                val reason = settle.preflightBearerWithEndorsement(row)
+                if (reason != null) {
+                    Log.w(TAG, "preflight rejected ${row.voucherId.take(10)}: $reason")
+                    received.markRejected(row.voucherId, "PREFLIGHT_FAIL")
+                    activity.recordFailed("Settle would revert: $reason")
+                    state.value = state.value.copy(settleStatus = "blocked: $reason")
+                    continue
+                }
                 val tx = settle.settleBearerWithEndorsement(row)
                 received.markSettled(row.voucherId, tx)
                 WalletMesh.broadcastSettled(row.voucherId, tx)
