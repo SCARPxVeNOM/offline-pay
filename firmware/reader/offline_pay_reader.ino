@@ -167,8 +167,13 @@ void loop() {
   Serial.println(String("[CARD] uid=") + uid);
 
   String voucherJson = readVoucher();
-  if (voucherJson.length() == 0) {
-    Serial.println("[CARD] no voucher payload");
+  // Reject obvious garbage early. A real voucher JSON starts with `{"v":`
+  // and is at least ~200 bytes. Anything shorter is a stale write or an
+  // empty card — bail out fast so we don't enter the 10-second decision
+  // wait (which would eat the phone's WRITE/CHALLENGE traffic).
+  if (voucherJson.length() < 50 || !voucherJson.startsWith("{\"v\"")) {
+    Serial.println(String("[CARD] no usable voucher (got '")
+                  + voucherJson + "') — skipping read flow");
     flashRed("EMPTY");
     halt();
     return;
@@ -273,6 +278,14 @@ void halt() {
 
 // --- Bluetooth ------------------------------------------------------------
 
+/// Block-read the BT socket waiting for an ACCEPT or REJECT decision.
+///
+/// While we wait, the phone may legitimately send unrelated commands
+/// (REQUEST_CHALLENGE, CLAIM, WRITE, STATUS) — earlier we'd swallow
+/// those as the "decision" and dump them. Now we route any non-decision
+/// line through the same handler the main loop uses, so a paired phone
+/// can complete its WRITE handshake even if a card happens to be on
+/// the reader at the time.
 String waitForDecision(unsigned long timeoutMs) {
   unsigned long start = millis();
   String line;
@@ -281,10 +294,16 @@ String waitForDecision(unsigned long timeoutMs) {
       char c = SerialBT.read();
       if (c == '\n' || c == '\r') {
         line.trim();
-        if (line.length() > 0) return line;
+        if (line.length() > 0) {
+          if (line == "ACCEPT" || line == "REJECT") return line;
+          // Anything else is a real BT command. Hand it off and keep
+          // waiting for the actual decision.
+          handleBtLine(line);
+          line = "";
+        }
       } else {
         line += c;
-        if (line.length() > 32) line = ""; // junk guard
+        if (line.length() > 1500) line = ""; // junk guard
       }
     }
     delay(20);
