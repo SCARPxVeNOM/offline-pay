@@ -371,11 +371,34 @@ class HomeActivity : ComponentActivity() {
 
         try {
             runCatching { backend.init(keyVault.address, 0L) }
-            // Split: bearer-with-endorsement vouchers go through the
-            // dedicated contract path (one per tx — no batch helper for
-            // it yet); recipient-bound bearer vouchers continue through
-            // the existing settleBearerBatch.
-            val endorsed = pending.filter { it.endorsementSig != null }
+            // Split into three groups by what contract path applies:
+            //   1. true-bearer (recipient=0) WITH endorsement → settleBearerWithEndorsement
+            //   2. true-bearer (recipient=0) WITHOUT endorsement → unsettleable, quarantine
+            //   3. recipient-bound (recipient!=0) → settleBearerBatch
+            // Without #2's quarantine, a stale endorsement-less bearer
+            // row (e.g. from a pre-B2 APK) keeps cycling through the
+            // wrong contract path and reverting forever.
+            val ZERO = "0x0000000000000000000000000000000000000000"
+            val (endorsed, unendorsedBearer, recipientBound) = run {
+                val a = mutableListOf<VoucherRow>()
+                val b = mutableListOf<VoucherRow>()
+                val c = mutableListOf<VoucherRow>()
+                for (row in pending) {
+                    when {
+                        row.recipient == ZERO && row.endorsementSig != null -> a += row
+                        row.recipient == ZERO                               -> b += row
+                        else                                                -> c += row
+                    }
+                }
+                Triple(a, b, c)
+            }
+            // Quarantine unendorsable bearer rows so they don't keep
+            // burning gas on settleBearerBatch reverts.
+            for (row in unendorsedBearer) {
+                Log.w(TAG, "unsettleable bearer voucher (no endorsement): ${row.voucherId}")
+                received.markRejected(row.voucherId, "BEARER_NEEDS_ENDORSEMENT")
+                activity.recordFailed("Bearer voucher needs reader-tap to settle")
+            }
             for (row in endorsed) {
                 val tx = settle.settleBearerWithEndorsement(row)
                 received.markSettled(row.voucherId, tx)
@@ -384,11 +407,12 @@ class HomeActivity : ComponentActivity() {
                 activity.recordSettled(listOf(row.voucherId), tx)
                 Log.i(TAG, "endorsed bearer settled: ${row.voucherId.take(10)} tx=${tx.take(10)}")
             }
-            val recipientBound = pending.filter { it.endorsementSig == null }
             if (recipientBound.isEmpty()) {
                 renderBalance()
-                state.value = state.value.copy(
-                    settleStatus = "⛓ settled ${endorsed.size} bearer voucher(s)")
+                if (endorsed.isNotEmpty() || unendorsedBearer.isNotEmpty()) {
+                    state.value = state.value.copy(
+                        settleStatus = "⛓ settled ${endorsed.size}; quarantined ${unendorsedBearer.size}")
+                }
                 return
             }
             // Below: existing recipient-bound batch path.

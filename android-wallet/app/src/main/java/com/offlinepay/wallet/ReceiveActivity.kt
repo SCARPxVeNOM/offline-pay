@@ -375,25 +375,51 @@ class ReceiveActivity : ComponentActivity() {
             Log.d(TAG, "init for gas top-up")
             runCatching { backend.init(keyVault.address, 0L) }
                 .onFailure { Log.w(TAG, "init failed (non-fatal): ${it.message}") }
-            Log.d(TAG, "broadcasting settleBearerBatch for ${pending.size}")
+
+            // Same three-way split as HomeActivity: true-bearer with
+            // endorsement → settleBearerWithEndorsement; true-bearer
+            // without endorsement → quarantine; recipient-bound →
+            // settleBearerBatch. Never call settleBearerBatch on a
+            // recipient=0 voucher — the contract reverts.
+            val zeroAddr = "0x0000000000000000000000000000000000000000"
+            val endorsed         = pending.filter { it.recipient == zeroAddr && it.endorsementSig != null }
+            val unendorsedBearer = pending.filter { it.recipient == zeroAddr && it.endorsementSig == null }
+            val recipientBound   = pending.filter { it.recipient != zeroAddr }
+            for (row in unendorsedBearer) {
+                Log.w(TAG, "unsettleable bearer voucher (no endorsement): ${row.voucherId}")
+                store.markRejected(row.voucherId, "BEARER_NEEDS_ENDORSEMENT")
+                activity.recordFailed("Bearer voucher needs reader-tap to settle")
+            }
+            for (row in endorsed) {
+                val tx = settle.settleBearerWithEndorsement(row)
+                store.markSettled(row.voucherId, tx)
+                WalletMesh.broadcastSettled(row.voucherId, tx)
+                activity.recordSettled(listOf(row.voucherId), tx)
+                state.value = state.value.copy(
+                    status = "⛓ settled bearer — tx ${tx.take(10)}…",
+                    statusKind = StatusKind.Success)
+            }
+            if (recipientBound.isEmpty()) return
+
+            Log.d(TAG, "broadcasting settleBearerBatch for ${recipientBound.size}")
             val tx = try {
-                settle.settleBearerBatch(pending)
+                settle.settleBearerBatch(recipientBound)
             } catch (t: Throwable) {
                 Log.w(TAG, "direct settle failed: ${t.message}", t)
                 val isGasIssue = t.message?.contains("insufficient funds") == true ||
                                  t.message?.contains("nonce") == true
                 if (isGasIssue) {
                     Log.d(TAG, "falling back to backend relay")
-                    relaySettle(pending) ?: throw t
+                    relaySettle(recipientBound) ?: throw t
                 } else throw t
             }
             Log.d(TAG, "settle tx=$tx")
-            pending.forEach {
+            recipientBound.forEach {
                 store.markSettled(it.voucherId, tx)
                 WalletMesh.broadcastSettled(it.voucherId, tx)
             }
-            activity.recordSettled(pending.map { it.voucherId }, tx)
-            state.value = state.value.copy(status = "⛓ settled ${pending.size} — tx ${tx.take(10)}…",
+            activity.recordSettled(recipientBound.map { it.voucherId }, tx)
+            state.value = state.value.copy(status = "⛓ settled ${recipientBound.size} — tx ${tx.take(10)}…",
                 statusKind = StatusKind.Success)
         } catch (t: Throwable) {
             Log.e(TAG, "settle failed", t)
