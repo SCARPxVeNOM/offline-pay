@@ -29,19 +29,37 @@ import com.offlinepay.wallet.EspBondState
 
 data class CardWriteState(
     val bond: EspBondState = EspBondState(),
+    /// First entry of the recipient address. Both fields must match
+    /// AND be a valid 0x + 40 hex string for `confirmedRecipient` to
+    /// resolve to non-null. QR scanner fills both at once.
     val recipient: String = "",
+    val recipientConfirm: String = "",
     val amount: String = "1.00",
     val busy: Boolean = false,
     val status: String = "",
     val statusKind: StatusKind = StatusKind.Idle,
     val error: String? = null,
-)
+) {
+    val confirmedRecipient: String?
+        get() {
+            val a = recipient.trim().lowercase()
+            val b = recipientConfirm.trim().lowercase()
+            return if (a.isNotBlank() && a == b && a.matches(Regex("^0x[0-9a-f]{40}$"))) a
+                   else null
+        }
+
+    val typoMismatch: Boolean
+        get() = recipient.isNotBlank() && recipientConfirm.isNotBlank() &&
+                recipient.trim().lowercase() != recipientConfirm.trim().lowercase()
+}
 
 @Composable
 fun CardWriteScreen(
     state: CardWriteState,
     onClose: () -> Unit,
     onAmountChange: (String) -> Unit,
+    onRecipientChange: (String) -> Unit,
+    onRecipientConfirmChange: (String) -> Unit,
     onScanQr: () -> Unit,
     onWrite: () -> Unit,
 ) {
@@ -57,8 +75,19 @@ fun CardWriteScreen(
             ReaderState(state.bond)
             Spacer(Modifier.height(20.dp))
 
-            SectionHeader("Recipient", if (state.recipient.isBlank()) "REQUIRED" else "")
-            RecipientCard(state.recipient, onScanQr = onScanQr)
+            val recipientLabel = when {
+                state.confirmedRecipient != null -> "✓ MATCHED"
+                state.typoMismatch               -> "✗ DOES NOT MATCH"
+                state.recipient.isBlank()        -> "REQUIRED"
+                else                             -> "RE-TYPE TO CONFIRM"
+            }
+            SectionHeader("Recipient", recipientLabel)
+            RecipientCard(
+                state = state,
+                onChange = onRecipientChange,
+                onChangeConfirm = onRecipientConfirmChange,
+                onScanQr = onScanQr,
+            )
             Spacer(Modifier.height(16.dp))
 
             SectionHeader("Amount", "USDC")
@@ -79,11 +108,13 @@ fun CardWriteScreen(
         }
 
         Box(Modifier.fillMaxWidth().padding(16.dp)) {
+            val canWrite = state.bond.isPaired &&
+                    state.confirmedRecipient != null &&
+                    !state.busy
             Surface(
-                onClick = { if (!state.busy) onWrite() },
+                onClick = { if (canWrite) onWrite() },
                 shape = RoundedCornerShape(20.dp),
-                color = if (state.bond.isPaired && !state.busy) OffpayColors.Ink
-                        else OffpayColors.InkSoft,
+                color = if (canWrite) OffpayColors.Ink else OffpayColors.InkSoft,
                 modifier = Modifier.fillMaxWidth().height(54.dp),
             ) {
                 Box(contentAlignment = Alignment.Center) {
@@ -133,7 +164,12 @@ private fun ReaderState(bond: EspBondState) {
 }
 
 @Composable
-private fun RecipientCard(recipient: String, onScanQr: () -> Unit) {
+private fun RecipientCard(
+    state: CardWriteState,
+    onChange: (String) -> Unit,
+    onChangeConfirm: (String) -> Unit,
+    onScanQr: () -> Unit,
+) {
     Box(
         Modifier
             .fillMaxWidth()
@@ -142,15 +178,33 @@ private fun RecipientCard(recipient: String, onScanQr: () -> Unit) {
             .padding(16.dp)
     ) {
         Column {
-            if (recipient.isBlank()) {
-                Text("Scan the merchant's QR code to lock the recipient.",
-                    color = OffpayColors.InkSoft, fontSize = 13.sp)
-            } else {
-                MonoLabel("RECIPIENT (V3 — SIGNED INTO VOUCHER)")
+            MonoLabel("ENTER RECIPIENT 0x… ADDRESS")
+            Spacer(Modifier.height(6.dp))
+            AddressBox(
+                value = state.recipient,
+                onChange = onChange,
+                placeholder = "0x…",
+            )
+            Spacer(Modifier.height(8.dp))
+            MonoLabel("RE-TYPE TO CONFIRM")
+            Spacer(Modifier.height(6.dp))
+            AddressBox(
+                value = state.recipientConfirm,
+                onChange = onChangeConfirm,
+                placeholder = "0x…",
+                outlineColor = when {
+                    state.confirmedRecipient != null -> OffpayColors.TealDeep
+                    state.typoMismatch               -> Color(0xFFB30E00)
+                    else                             -> OffpayColors.Hairline
+                },
+            )
+
+            if (state.typoMismatch) {
                 Spacer(Modifier.height(6.dp))
-                Text(recipient, color = OffpayColors.Ink,
-                    fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Text("Addresses don't match — type the second one again or scan a QR.",
+                    color = Color(0xFFB30E00), fontSize = 12.sp)
             }
+
             Spacer(Modifier.height(12.dp))
             Surface(
                 onClick = onScanQr,
@@ -165,7 +219,8 @@ private fun RecipientCard(recipient: String, onScanQr: () -> Unit) {
                         Icon(Icons.Outlined.QrCodeScanner, null, tint = OffpayColors.Ink,
                             modifier = Modifier.size(16.dp))
                         Text(
-                            if (recipient.isBlank()) "Scan recipient QR" else "Re-scan",
+                            if (state.confirmedRecipient != null) "Re-scan QR (overwrite)"
+                            else "Or scan recipient QR",
                             color = OffpayColors.Ink, fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                         )
@@ -173,6 +228,38 @@ private fun RecipientCard(recipient: String, onScanQr: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun AddressBox(
+    value: String,
+    onChange: (String) -> Unit,
+    placeholder: String,
+    outlineColor: Color = OffpayColors.Hairline,
+) {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .border(1.dp, outlineColor, RoundedCornerShape(12.dp))
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+    ) {
+        if (value.isBlank()) {
+            Text(placeholder, color = OffpayColors.InkMuted,
+                fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+        }
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            singleLine = true,
+            textStyle = TextStyle(
+                color = OffpayColors.Ink,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+            ),
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 

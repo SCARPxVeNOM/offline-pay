@@ -42,7 +42,10 @@ class CardWriteActivity : ComponentActivity() {
             // a leading "ethereum:" prefix from external wallets too.
             val addr = text.trim().removePrefix("ethereum:").trim()
             if (addr.matches(Regex("^0x[0-9a-fA-F]{40}$"))) {
-                ui.value = ui.value.copy(recipient = addr.lowercase(), error = null)
+                // Fill BOTH fields so the typo-guard goes green immediately;
+                // user already opted into "I trust the QR".
+                val low = addr.lowercase()
+                ui.value = ui.value.copy(recipient = low, recipientConfirm = low, error = null)
             } else {
                 ui.value = ui.value.copy(error = "Scanned QR is not a 0x address: $text")
             }
@@ -75,6 +78,10 @@ class CardWriteActivity : ComponentActivity() {
                     state = s,
                     onClose = { finish() },
                     onAmountChange = { ui.value = ui.value.copy(amount = it, error = null) },
+                    onRecipientChange = { ui.value = ui.value.copy(recipient = it, error = null) },
+                    onRecipientConfirmChange = {
+                        ui.value = ui.value.copy(recipientConfirm = it, error = null)
+                    },
                     onScanQr = {
                         qrLauncher.launch(Intent(this, QrScanActivity::class.java))
                     },
@@ -91,11 +98,14 @@ class CardWriteActivity : ComponentActivity() {
             ui.value = s.copy(error = "Pair an ESP32 reader first (Home → Reader)")
             return
         }
-        val recipient = s.recipient
-        if (recipient.isBlank() || !recipient.matches(Regex("^0x[0-9a-fA-F]{40}$"))) {
-            ui.value = s.copy(error = "Scan a recipient QR first")
-            return
-        }
+        val recipient = s.confirmedRecipient
+            ?: run {
+                ui.value = s.copy(
+                    error = if (s.typoMismatch) "Recipient addresses don't match — re-type to confirm"
+                            else "Enter the recipient address twice (or scan a QR)",
+                )
+                return
+            }
         val amountBaseUnits = parseUsdc(s.amount)
         if (amountBaseUnits == null || amountBaseUnits <= 0L) {
             ui.value = s.copy(error = "Enter an amount in USDC")
