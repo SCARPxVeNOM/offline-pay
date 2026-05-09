@@ -218,6 +218,24 @@ class ReceiveActivity : ComponentActivity() {
             )
             return
         }
+
+        // Re-tap path: if the voucher already exists in our store but
+        // we have a fresh endorsement, refresh the row's endorsement
+        // fields and retry autoSettle. Without this, an earlier failed
+        // settle (e.g. bad firmware-sig that the contract rejected)
+        // would loop forever on the stored bad signature.
+        if (isBearer && endorsement != null && result == VerifyResult.ALREADY_SEEN) {
+            Log.i(TAG, "refreshing endorsement on already-seen voucher ${v.voucherId.take(10)}")
+            store.refreshEndorsement(v.voucherId, endorsement)
+            btBridge?.sendDecision(true)
+            state.value = state.value.copy(
+                status = "refreshed endorsement — retrying settle",
+                statusKind = StatusKind.Working,
+            )
+            if (isOnline()) tryAutoSettle()
+            return
+        }
+
         if (result == VerifyResult.VALID) {
             store.saveAccepted(v, endorsement)
             activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())

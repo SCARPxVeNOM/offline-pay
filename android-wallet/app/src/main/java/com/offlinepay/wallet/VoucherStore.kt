@@ -94,6 +94,21 @@ interface VoucherDao {
 
     @Query("UPDATE vouchers SET replicaCount=:count, replicaPeers=:peers WHERE voucherId=:id")
     suspend fun updateReplication(id: String, count: Int, peers: String)
+
+    /// Refresh the endorsement on an existing row. Used when a card is
+    /// re-tapped on a reader and the previous on-chain settle reverted
+    /// (e.g. malformed firmware sig). Each tap produces a fresh
+    /// endorsement with a new timestamp; replacing the stored one lets
+    /// autoSettle retry with the new sig instead of looping forever
+    /// on the bad one.
+    @Query(
+        "UPDATE vouchers SET endorsementTs=:ts, endorsementPrimary=:primary, " +
+        "endorsementDevice=:device, endorsementSig=:sig, status='accepted' " +
+        "WHERE voucherId=:id"
+    )
+    suspend fun refreshEndorsement(
+        id: String, ts: Long, primary: String, device: String, sig: String
+    )
 }
 
 @Dao
@@ -153,6 +168,15 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
 
     override fun exists(id: String): Boolean = dao.exists(id)
     suspend fun get(id: String): VoucherRow? = dao.get(id)
+
+    suspend fun refreshEndorsement(voucherId: String, e: Endorsement) =
+        dao.refreshEndorsement(
+            id = voucherId,
+            ts = e.timestamp,
+            primary = e.merchantPrimary,
+            device = e.deviceAddress,
+            sig = e.signature,
+        )
 
     suspend fun saveAccepted(v: Voucher, endorsement: Endorsement? = null) {
         dao.insert(VoucherRow(
