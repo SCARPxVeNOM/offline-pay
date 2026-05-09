@@ -12,8 +12,14 @@ data class CardVoucherPayload(
     @SerialName("v") val version: Int = 2,
     @SerialName("i") val voucherId: String,
     @SerialName("p") val payer: String,
-    @SerialName("m") val merchant: String,
-    @SerialName("r") val recipient: String,
+    /// Defaults to the zero address. The encoder is configured with
+    /// `encodeDefaults = false`, so when these fields equal the default
+    /// they are omitted from the wire JSON. This shrinks bearer cards
+    /// (where both are 0x0) by ~100 bytes — the difference between
+    /// fitting a MIFARE Classic 1K (336B) or not. Recipient-bound
+    /// vouchers set non-zero recipient explicitly, which gets included.
+    @SerialName("m") val merchant: String = "0x0000000000000000000000000000000000000000",
+    @SerialName("r") val recipient: String = "0x0000000000000000000000000000000000000000",
     @SerialName("a") val amount: String,
     @SerialName("e") val expiry: Long,
     @SerialName("n") val nonce: Long,
@@ -59,7 +65,13 @@ data class Voucher(
     }
 }
 
-private val cardJson = Json { encodeDefaults = true; ignoreUnknownKeys = true }
+// Important: encodeDefaults = false. CardVoucherPayload has defaults for
+// merchant + recipient (both 0x0) so they're omitted from bearer-card
+// JSON, shrinking the payload to fit a MIFARE Classic 1K's 336-byte
+// data area. Non-bearer (recipient-bound) vouchers carry non-default
+// values which get serialized normally. The deserializer round-trips
+// correctly because the missing fields fall back to the defaults above.
+private val cardJson = Json { encodeDefaults = false; ignoreUnknownKeys = true }
 
 /// Serialize a freshly-signed voucher into the wire JSON. Matches
 /// backend/voucher.js:voucherToCardJson byte-for-byte. `cardUid` is
