@@ -97,8 +97,8 @@ class ReceiveActivity : ComponentActivity() {
         btBridge = try {
             BluetoothBridge(this, scope = lifecycleScope, bondStore = EspBondStore(this)).also { bt ->
                 lifecycleScope.launch {
-                    bt.vouchers.collect { v ->
-                        walletScope.launch { handleIncomingVoucher(v) }
+                    bt.incoming.collect { iv ->
+                        walletScope.launch { handleIncomingVoucher(iv.voucher, iv.endorsement) }
                     }
                 }
             }
@@ -197,11 +197,29 @@ class ReceiveActivity : ComponentActivity() {
         Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
     }
 
-    private suspend fun handleIncomingVoucher(v: Voucher) {
-        val result = verifier.verify(v)
-        Log.d(TAG, "BT verify ${v.voucherId.take(10)} -> $result")
+    private suspend fun handleIncomingVoucher(v: Voucher, endorsement: Endorsement? = null) {
+        // True-bearer cards (recipient = 0x0) are settled via the
+        // endorsed path. Their receipt-time check skips the recipient
+        // binding (it doesn't exist) but everything else — sig, expiry,
+        // amount, dedupe — still applies.
+        val isBearer = v.isTrueBearer
+        val result = if (isBearer) verifier.verifyForMesh(v) else verifier.verify(v)
+        Log.d(TAG, "BT verify ${v.voucherId.take(10)} bearer=$isBearer -> $result")
+
+        // For bearer the endorsement is REQUIRED — without it the contract
+        // refuses to settle at all. Reject any bearer voucher that arrives
+        // unendorsed (e.g. a malicious peer trying to feed us blanks).
+        if (isBearer && endorsement == null) {
+            store.saveRejected(v, "BEARER_NO_ENDORSEMENT")
+            btBridge?.sendDecision(false)
+            state.value = state.value.copy(
+                status = "bearer voucher missing endorsement — rejected",
+                statusKind = StatusKind.Error,
+            )
+            return
+        }
         if (result == VerifyResult.VALID) {
-            store.saveAccepted(v)
+            store.saveAccepted(v, endorsement)
             activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())
             // Gossip to mesh peers so a third (online) device can relay-settle
             // even if both sender and receiver stay offline. No-op if no peers.
@@ -209,7 +227,8 @@ class ReceiveActivity : ComponentActivity() {
             btBridge?.sendDecision(true)
             val amt = "%.2f".format(v.amount.toDouble() / 1e6)
             state.value = state.value.copy(
-                status = "received $amt USDC via ESP32",
+                status = if (isBearer) "received $amt USDC (bearer card)"
+                         else          "received $amt USDC via ESP32",
                 statusKind = StatusKind.Success,
             )
         } else {

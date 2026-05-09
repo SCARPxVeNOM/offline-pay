@@ -51,6 +51,27 @@ class VoucherSigner(
         return sign(merchant, recipient, amountUsdc, ttlSeconds, tracker.next())
     }
 
+    /// Sign a *true-bearer* voucher whose recipient gets bound at SPEND
+    /// time by an ESP32 endorsement, not at signing time. Used by the
+    /// MIFARE / keyfob card-write flow: the customer doesn't know which
+    /// merchant they'll pay yet — only the merchant's reader, when
+    /// tapped, will commit a primary wallet via its own signature.
+    ///
+    /// The contract refuses this voucher on the regular bearer path
+    /// (it requires recipient != 0); it's only redeemable through
+    /// `settleBearerWithEndorsement`, which verifies BOTH the customer's
+    /// signature here AND a fresh endorsement from a registered device.
+    fun signNextBearerForCard(
+        amountUsdc: BigInteger,
+        ttlSeconds: Long,
+    ): SignedVoucher {
+        val tracker = nonces
+            ?: error("VoucherSigner constructed without NonceTracker — refuse to sign")
+        return sign(merchant = null, recipient = ZERO_ADDR,
+                    amountUsdc = amountUsdc, ttlSeconds = ttlSeconds,
+                    nonce = tracker.next())
+    }
+
     /// Test/legacy entrypoint. Production code must call [signNext] instead.
     fun sign(
         merchant: String?,

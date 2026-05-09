@@ -191,6 +191,82 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         emit VoucherSettled(v.voucherId, v.payer, v.recipient, v.amount, v.nonce);
     }
 
+    // ─── Endorsed bearer settle (true-bearer cards) ─────────────────────
+    //
+    // For physical bearer cards (MIFARE), the customer signs a voucher
+    // with `recipient = address(0)` — at top-up time they don't know
+    // which merchant will be paid. The merchant's reader (an ESP32 with
+    // its own EVM key) signs a per-tap **endorsement** at spend time
+    // that commits to the actual merchant's primary wallet. Anyone may
+    // call `settleBearerWithEndorsement` (mesh relay friendly), but the
+    // funds always land at the address the endorsing device chose —
+    // a malicious relay cannot redirect.
+    //
+    // Trust model for the demo: no on-chain whitelist of devices. Any
+    // device with a wallet key can endorse to any primary. Production
+    // gates this via MerchantRegistry.resolveDevice (already in this
+    // contract via settleVoucherAsDevice — left in place, separate
+    // path). Removing the registry gate keeps the demo zero-setup.
+
+    function settleBearerWithEndorsement(
+        Voucher calldata v,
+        bytes calldata voucherSig,
+        address device,            // ESP32 EVM address (signer of `deviceSig`)
+        address merchantPrimary,   // payee (committed inside `deviceSig`)
+        uint256 endorsementTs,     // device's wallclock at endorse time (anti-replay scope)
+        bytes calldata deviceSig
+    )
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        require(v.merchant  == address(0), "not bearer");
+        require(v.recipient == address(0), "must be true bearer");
+        require(merchantPrimary != address(0), "primary=0");
+        require(device != address(0), "device=0");
+        require(!usedVouchers[v.voucherId], "already settled");
+        require(block.timestamp <= v.expiry, "expired");
+        require(v.amount > 0 && v.amount <= maxSinglePayment, "bad amount");
+        require(lockedBalance[v.payer] >= v.amount, "insufficient locked");
+
+        // Customer's voucher signature.
+        bytes32 vDigest = voucherDigest(v);
+        require(vDigest.toEthSignedMessageHash().recover(voucherSig) == v.payer,
+                "bad voucher sig");
+
+        // Device's endorsement signature.
+        bytes32 eDigest = endorsementDigest(v.voucherId, device, merchantPrimary, endorsementTs);
+        require(eDigest.toEthSignedMessageHash().recover(deviceSig) == device,
+                "bad endorsement sig");
+
+        usedVouchers[v.voucherId] = true;
+        lockedBalance[v.payer]   -= v.amount;
+
+        require(usdc.transfer(merchantPrimary, v.amount), "payout failed");
+        emit VoucherSettled(v.voucherId, v.payer, merchantPrimary, v.amount, v.nonce);
+    }
+
+    /// @notice Canonical endorsement preimage. ESP32 firmware MUST hash the
+    ///         same fields in the same order, then EIP-191-prefix and sign.
+    ///         Mirrors `voucherDigest` so off-chain code on any platform
+    ///         (ESP32, phone) can re-derive the digest deterministically.
+    function endorsementDigest(
+        bytes32 voucherId,
+        address device,
+        address merchantPrimary,
+        uint256 endorsementTs
+    ) public view returns (bytes32) {
+        return keccak256(abi.encode(
+            keccak256("OFFPAY-ENDORSE-V1"),
+            voucherId,
+            device,
+            merchantPrimary,
+            endorsementTs,
+            block.chainid,
+            address(this)
+        ));
+    }
+
     function _settle(Voucher calldata v, bytes calldata sig, address claimer) internal {
         require(!usedVouchers[v.voucherId], "already settled");
         require(block.timestamp <= v.expiry, "expired");

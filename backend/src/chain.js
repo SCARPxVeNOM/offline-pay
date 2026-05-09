@@ -24,6 +24,9 @@ const VAULT_ABI = [
   // not a separate argument, so anyone can broadcast (relay-friendly).
   `function settleBearer(${VOUCHER},bytes)`,
   `function settleBearerBatch(${VOUCHER}[],bytes[])`,
+  // True-bearer + ESP32 endorsement (B2 cards). Voucher.recipient = 0;
+  // payout goes to `merchantPrimary` committed in the device's signature.
+  `function settleBearerWithEndorsement(${VOUCHER},bytes,address,address,uint256,bytes)`,
   "event VoucherSettled(bytes32 indexed voucherId, address indexed payer, address indexed recipient, uint256 amount, uint256 nonce)",
   "event FundsLocked(address indexed payer, uint256 amount, uint256 newBalance)"
 ];

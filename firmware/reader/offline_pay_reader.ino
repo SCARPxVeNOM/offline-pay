@@ -40,6 +40,19 @@
 
 #define DECISION_TIMEOUT_MS  10000UL
 #define CLAIM_DOMAIN         "OFFPAY-CLAIM-V1"
+#define ENDORSE_DOMAIN       "OFFPAY-ENDORSE-V1"
+
+// On-chain settlement target. MUST match phones' Config.kt VAULT_ADDRESS.
+// Re-deploys the vault → bump the bytes here AND reflash every reader.
+static const uint8_t VAULT_BYTES[20] = {
+  0x3e, 0x73, 0xaa, 0x75, 0x06, 0xc5, 0xa8, 0x33, 0xe0, 0x84,
+  0x2c, 0x94, 0x84, 0x58, 0xaf, 0x9d, 0x63, 0xc1, 0x9d, 0xcd
+};
+static const uint64_t CHAIN_ID_VAL = 80002;  // Polygon Amoy
+
+// keccak256("OFFPAY-ENDORSE-V1") cached in setup() so the endorsement
+// digest computation in onWrite/loop doesn't re-hash on every tap.
+static uint8_t s_endorseDomainHash[32];
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 BluetoothSerial SerialBT;
@@ -133,6 +146,10 @@ void setup() {
     Serial.println("[wallet] init FAILED — settlement disabled");
   }
 
+  // Pre-compute keccak256("OFFPAY-ENDORSE-V1") once. Used as the first
+  // 32-byte field in the endorsement digest preimage on every card read.
+  keccak256_arduino((const uint8_t*)ENDORSE_DOMAIN, strlen(ENDORSE_DOMAIN), s_endorseDomainHash);
+
   Serial.println("[RC522] reader ready, waiting for card...");
   showReady();
 }
@@ -168,6 +185,14 @@ void loop() {
   SerialBT.print(uid);
   SerialBT.print(" ");
   SerialBT.println(voucherJson);
+
+  // For B2 (true-bearer cards), emit a fresh endorsement so the relay
+  // can settle via `settleBearerWithEndorsement`. This commits THIS
+  // reader (and its bonded merchant primary) as the recipient — a
+  // malicious mesh relay can't redirect funds without forging this
+  // signature. We always emit when a bonded owner exists; phone side
+  // ignores the endorsement when the voucher is recipient-bound.
+  emitEndorsement(voucherJson);
 
   String decision = waitForDecision(DECISION_TIMEOUT_MS);
   Serial.println(String("[BT] decision=") + decision);
@@ -598,6 +623,83 @@ String writeVoucher(const String& jsonText) {
     }
   }
   return String("");
+}
+
+// --- ENDORSE flow --------------------------------------------------------
+//
+// At every successful read, sign an endorsement that commits this reader
+// (and its bonded merchant primary) as the payee for the voucher just
+// scanned. Output line:
+//   ENDORSE <ts> <merchantPrimaryHex> <espAddrHex> <sigHex>
+//
+// The relay node bundles VOUCHER + ENDORSE and submits via
+// `settleBearerWithEndorsement(...)` on chain. If the voucher was
+// recipient-bound (recipient != 0), the phone ignores ENDORSE and uses
+// the legacy `settleBearer` path.
+
+void emitEndorsement(const String& voucherJson) {
+  if (!OfflinePayWallet::hasOwner()) return;
+
+  uint8_t voucherId[32];
+  if (!extractVoucherId(voucherJson.c_str(), voucherId)) {
+    Serial.println("[endorse] no voucherId in JSON — skipping");
+    return;
+  }
+  uint8_t owner20[20]; OfflinePayWallet::getOwner(owner20);
+  uint8_t self20[20];  OfflinePayWallet::addressBytes(self20);
+
+  // Build abi.encode(bytes32 domain, bytes32 voucherId, address device,
+  //                  address primary, uint256 ts, uint256 chainId,
+  //                  address vault)  — 7 × 32 = 224 bytes.
+  uint8_t pre[7 * 32]; memset(pre, 0, sizeof(pre));
+  memcpy(pre,            s_endorseDomainHash, 32);   // [0..32]
+  memcpy(pre + 32,       voucherId,           32);   // [32..64]
+  memcpy(pre + 64 + 12,  self20,              20);   // [76..96]
+  memcpy(pre + 96 + 12,  owner20,             20);   // [108..128]
+
+  uint64_t ts = (uint64_t)millis();                  // demo: monotonic uptime
+  for (int i = 0; i < 8; i++)
+    pre[128 + 24 + i] = (uint8_t)(ts >> (8 * (7 - i)));
+  for (int i = 0; i < 8; i++)
+    pre[160 + 24 + i] = (uint8_t)(CHAIN_ID_VAL >> (8 * (7 - i)));
+  memcpy(pre + 192 + 12, VAULT_BYTES, 20);
+
+  uint8_t digest[32];
+  keccak256_arduino(pre, sizeof(pre), digest);
+
+  // signEthMessage applies the EIP-191 prefix internally before ECDSA.
+  String sig = OfflinePayWallet::signEthMessage(digest, 32);
+  if (sig.length() == 0) {
+    Serial.println("[endorse] signing failed");
+    return;
+  }
+
+  SerialBT.print("ENDORSE ");
+  SerialBT.print((unsigned long)ts);
+  SerialBT.print(" 0x");
+  SerialBT.print(hexFromBytes(owner20, 20));
+  SerialBT.print(" 0x");
+  SerialBT.print(hexFromBytes(self20, 20));
+  SerialBT.print(" ");
+  SerialBT.println(sig);
+}
+
+// Tiny extractor: scans for the first occurrence of `"i":"0x` in the JSON
+// (matching CardVoucherPayload's @SerialName("i")) and reads the next 64
+// hex chars into `out32`. Returns false if the field isn't present or
+// the hex is malformed. Avoids pulling in a full JSON parser on the MCU.
+bool extractVoucherId(const char* json, uint8_t out32[32]) {
+  const char* needle = "\"i\":\"0x";
+  const char* p = strstr(json, needle);
+  if (!p) return false;
+  p += strlen(needle);
+  for (int i = 0; i < 32; i++) {
+    uint8_t hi, lo;
+    if (!hexCharToNibble(p[i*2],     &hi)) return false;
+    if (!hexCharToNibble(p[i*2 + 1], &lo)) return false;
+    out32[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
 }
 
 // keccak256 over arbitrary bytes. We have the same primitive in wallet.cpp

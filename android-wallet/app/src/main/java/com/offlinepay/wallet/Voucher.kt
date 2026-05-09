@@ -17,7 +17,12 @@ data class CardVoucherPayload(
     @SerialName("a") val amount: String,
     @SerialName("e") val expiry: Long,
     @SerialName("n") val nonce: Long,
-    @SerialName("s") val signature: String
+    @SerialName("s") val signature: String,
+    /// Hardware UID of the MIFARE card / keyfob this voucher was bound to
+    /// at top-up. Optional (null for phone-tap flows). Merchant's ESP32
+    /// validates `cardUid == card.PICC_ReadCardSerial` before forwarding,
+    /// so a voucher copied to a different card won't pass the reader.
+    @SerialName("u") val cardUid: String? = null,
 )
 
 /// In-memory voucher fields used by verifier + Room DAO. `recipient` is
@@ -30,8 +35,15 @@ data class Voucher(
     val amount: java.math.BigInteger,
     val expiry: Long,
     val nonce: Long,
-    val signature: String
+    val signature: String,
+    /// MIFARE/keyfob hardware UID this voucher was bound to. Null for
+    /// phone-tap (HCE) and QR/NFC flows. Set only when the voucher was
+    /// loaded onto a physical card via `signBearerForCard`.
+    val cardUid: String? = null,
 ) {
+    val isTrueBearer: Boolean
+        get() = recipient == "0x0000000000000000000000000000000000000000"
+
     companion object {
         fun fromCardPayload(p: CardVoucherPayload) = Voucher(
             voucherId = p.voucherId,
@@ -41,7 +53,8 @@ data class Voucher(
             amount    = java.math.BigInteger(p.amount),
             expiry    = p.expiry,
             nonce     = p.nonce,
-            signature = p.signature
+            signature = p.signature,
+            cardUid   = p.cardUid,
         )
     }
 }
@@ -49,8 +62,9 @@ data class Voucher(
 private val cardJson = Json { encodeDefaults = true; ignoreUnknownKeys = true }
 
 /// Serialize a freshly-signed voucher into the wire JSON. Matches
-/// backend/voucher.js:voucherToCardJson byte-for-byte.
-fun VoucherSigner.SignedVoucher.toCardJson(): String =
+/// backend/voucher.js:voucherToCardJson byte-for-byte. `cardUid` is
+/// included only for bearer cards bound to a specific MIFARE.
+fun VoucherSigner.SignedVoucher.toCardJson(cardUid: String? = null): String =
     cardJson.encodeToString(
         CardVoucherPayload.serializer(),
         CardVoucherPayload(
@@ -61,7 +75,8 @@ fun VoucherSigner.SignedVoucher.toCardJson(): String =
             amount    = amount.toString(),
             expiry    = expiry,
             nonce     = nonce,
-            signature = signature
+            signature = signature,
+            cardUid   = cardUid,
         )
     )
 

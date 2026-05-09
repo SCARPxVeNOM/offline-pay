@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.serialization.json.Json
@@ -13,8 +14,28 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
 
-/// Connects to the ESP32 Bluetooth SPP, parses incoming `VOUCHER <uid> <json>`
-/// frames, exposes them as a Flow, and writes ACCEPT / REJECT decisions back.
+/// Endorsement signed by the ESP32 reader committing to the merchant
+/// primary at tap time. Reaches the contract via
+/// `settleBearerWithEndorsement` for true-bearer cards (recipient = 0).
+data class Endorsement(
+    val timestamp: Long,
+    val merchantPrimary: String,
+    val deviceAddress: String,
+    val signature: String,
+)
+
+/// What the merchant phone receives on every card tap. The endorsement is
+/// non-null when the firmware emitted an ENDORSE line right after the
+/// VOUCHER frame (B2 bearer-card path); null when only a recipient-bound
+/// VOUCHER arrived (legacy / phone-tap fallback).
+data class IncomingVoucher(
+    val voucher: Voucher,
+    val endorsement: Endorsement?,
+)
+
+/// Connects to the ESP32 Bluetooth SPP, parses incoming VOUCHER (optionally
+/// followed by ENDORSE) frames, exposes them as a Flow, and writes
+/// ACCEPT / REJECT decisions back.
 class BluetoothBridge(
     private val ctx: Context,
     private val deviceName: String = Config.BT_DEVICE_NAME,
@@ -26,8 +47,10 @@ class BluetoothBridge(
     /// for backward compatibility with code that hasn't paired yet.
     private val bondStore: EspBondStore? = null,
 ) {
-    private val _vouchers = MutableSharedFlow<Voucher>(extraBufferCapacity = 16)
-    val vouchers: SharedFlow<Voucher> = _vouchers
+    private val _incoming = MutableSharedFlow<IncomingVoucher>(extraBufferCapacity = 16)
+    /// Primary stream consumers should use. Each emission carries the
+    /// voucher plus the endorsement when one accompanied it.
+    val incoming: SharedFlow<IncomingVoucher> = _incoming
 
     private var socket: BluetoothSocket? = null
     private var output: OutputStream? = null
@@ -52,14 +75,45 @@ class BluetoothBridge(
                 Log.d(TAG, "connected to $deviceName")
 
                 val reader = BufferedReader(InputStreamReader(socket!!.inputStream))
-                while (isActive) {
-                    val line = reader.readLine() ?: break
-                    parseFrame(line)?.let { _vouchers.emit(it) }
-                }
+                runReadLoop(reader)
             } catch (e: Exception) {
                 Log.e(TAG, "BT loop error: ${e.message}")
             }
         }
+    }
+
+    /// Stateful line parser: a VOUCHER frame may be immediately followed
+    /// by an ENDORSE frame on the next line. We hold the voucher until
+    /// the next line arrives — if it's an ENDORSE we bundle, otherwise
+    /// we flush the voucher solo and process the new line.
+    private suspend fun runReadLoop(reader: BufferedReader) {
+        var pendingVoucher: Voucher? = null
+        while (kotlin.coroutines.coroutineContext[Job]?.isActive != false) {
+            val line = reader.readLine() ?: break
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith("VOUCHER ") -> {
+                    pendingVoucher?.let { _incoming.emit(IncomingVoucher(it, null)) }
+                    pendingVoucher = parseVoucherFrame(trimmed)
+                }
+                trimmed.startsWith("ENDORSE ") -> {
+                    val endorse = parseEndorseFrame(trimmed)
+                    val v = pendingVoucher
+                    if (endorse != null && v != null) {
+                        Log.d(TAG, "voucher ${v.voucherId.take(10)} endorsed by ${endorse.deviceAddress.take(10)} → ${endorse.merchantPrimary.take(10)}")
+                        _incoming.emit(IncomingVoucher(v, endorse))
+                    } else {
+                        Log.w(TAG, "ENDORSE without preceding VOUCHER (or bad endorse frame): '$trimmed'")
+                    }
+                    pendingVoucher = null
+                }
+                trimmed.isNotEmpty() -> {
+                    Log.v(TAG, "ignored frame: $trimmed")
+                }
+            }
+        }
+        // Flush any pending voucher on socket close.
+        pendingVoucher?.let { _incoming.emit(IncomingVoucher(it, null)) }
     }
 
     fun sendDecision(accept: Boolean) {
@@ -70,13 +124,11 @@ class BluetoothBridge(
 
     fun close() { try { socket?.close() } catch (_: Exception) {} }
 
-    private fun parseFrame(line: String): Voucher? {
+    private fun parseVoucherFrame(trimmed: String): Voucher? {
         // Reader prints either:
         //   VOUCHER <uid> <json>                     (legacy)
         //   VOUCHER <deviceAddr> <uid> <json>        (current — addr starts 0x)
         return try {
-            val trimmed = line.trim()
-            if (!trimmed.startsWith("VOUCHER ")) return null
             val parts = trimmed.split(" ", limit = 4)
             val readerAddr: String?
             val jsonText: String
@@ -106,8 +158,23 @@ class BluetoothBridge(
             val payload = json.decodeFromString(CardVoucherPayload.serializer(), jsonText)
             Voucher.fromCardPayload(payload)
         } catch (e: Exception) {
-            Log.e(TAG, "bad frame: $line", e); null
+            Log.e(TAG, "bad voucher frame: $trimmed", e); null
         }
+    }
+
+    /// Format: ENDORSE <ts> <merchantPrimary 0x…> <deviceAddr 0x…> <sig 0x…>
+    private fun parseEndorseFrame(trimmed: String): Endorsement? = try {
+        val parts = trimmed.split(" ").filter { it.isNotBlank() }
+        if (parts.size != 5) {
+            Log.w(TAG, "endorse frame has ${parts.size} tokens, expected 5"); null
+        } else Endorsement(
+            timestamp        = parts[1].toLong(),
+            merchantPrimary  = parts[2].lowercase(),
+            deviceAddress    = parts[3].lowercase(),
+            signature        = parts[4],
+        )
+    } catch (e: Exception) {
+        Log.e(TAG, "bad endorse frame: $trimmed", e); null
     }
 
     companion object { private const val TAG = "OfflinePay/BT" }

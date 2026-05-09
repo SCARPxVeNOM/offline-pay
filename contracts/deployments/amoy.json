@@ -2,8 +2,9 @@
   "network": "amoy",
   "chainId": 80002,
   "usdc": "0x17ffe8373658Fb333530e4446becb19dB6239e1e",
-  "vault": "0x2D8218329389545Cb12b37e2ED961BDB97d3661f",
+  "vault": "0x3E73aa7506c5a833E0842c948458af9d63C19dCd",
   "registry": "0xc1Ac9cAF9D7aE09dF1a1d587587fF1Ae6420Cc1a",
   "deployer": "0x092661531D9186Fa6E48501A5e3b508B3F52e64c",
-  "deployedAt": "2026-05-09T09:05:29.166Z"
+  "deployedAt": "2026-05-09T20:19:56.893Z",
+  "note": "vault redeployed in-place; usdc + registry preserved"
 }

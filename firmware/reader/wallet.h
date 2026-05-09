@@ -25,6 +25,10 @@ bool begin();
 // with the "0x" prefix, e.g. "0x4e0c...3a91".
 String address();
 
+// Same address, raw 20 bytes — useful when constructing on-chain
+// digests that abi-encode the address into a 32-byte slot.
+void addressBytes(uint8_t out20[20]);
+
 // Returns the secp256k1 public key (65 bytes uncompressed: 0x04 || X || Y),
 // hex-encoded without prefix.
 String publicKeyHex();

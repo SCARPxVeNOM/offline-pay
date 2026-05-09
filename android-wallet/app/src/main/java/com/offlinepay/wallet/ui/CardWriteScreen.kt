@@ -29,28 +29,41 @@ import com.offlinepay.wallet.EspBondState
 
 data class CardWriteState(
     val bond: EspBondState = EspBondState(),
-    /// First entry of the recipient address. Both fields must match
-    /// AND be a valid 0x + 40 hex string for `confirmedRecipient` to
-    /// resolve to non-null. QR scanner fills both at once.
-    val recipient: String = "",
-    val recipientConfirm: String = "",
+    /// MIFARE / keyfob hardware UID, typed by the user. Twice for
+    /// typo-guard. Only 4-byte (8 hex) or 7-byte (14 hex) UIDs are
+    /// accepted — the formats RC522 / NFC-A / MIFARE Classic produce.
+    /// Spaces, dashes, colons are tolerated and stripped client-side
+    /// so the user can paste in any common formatting.
+    val cardUid: String = "",
+    val cardUidConfirm: String = "",
     val amount: String = "1.00",
+    val online: Boolean = false,
     val busy: Boolean = false,
     val status: String = "",
     val statusKind: StatusKind = StatusKind.Idle,
     val error: String? = null,
 ) {
-    val confirmedRecipient: String?
+    /// Both fields must be valid hex AND match exactly. Returns the
+    /// canonicalized lowercase UID string; null otherwise.
+    val confirmedCardUid: String?
         get() {
-            val a = recipient.trim().lowercase()
-            val b = recipientConfirm.trim().lowercase()
-            return if (a.isNotBlank() && a == b && a.matches(Regex("^0x[0-9a-f]{40}$"))) a
-                   else null
+            val a = cardUid.normaliseUid()
+            val b = cardUidConfirm.normaliseUid()
+            return if (a != null && a == b) a else null
         }
 
     val typoMismatch: Boolean
-        get() = recipient.isNotBlank() && recipientConfirm.isNotBlank() &&
-                recipient.trim().lowercase() != recipientConfirm.trim().lowercase()
+        get() = cardUid.isNotBlank() && cardUidConfirm.isNotBlank() &&
+                cardUid.normaliseUid() != cardUidConfirm.normaliseUid()
+}
+
+/// Strip common formatting characters and lowercase. Returns null if
+/// the resulting string isn't a 4- or 7-byte hex UID.
+private fun String.normaliseUid(): String? {
+    val cleaned = trim().lowercase()
+        .removePrefix("0x")
+        .replace(":", "").replace("-", "").replace(" ", "")
+    return if (cleaned.matches(Regex("^[0-9a-f]{8}$|^[0-9a-f]{14}$"))) cleaned else null
 }
 
 @Composable
@@ -58,9 +71,8 @@ fun CardWriteScreen(
     state: CardWriteState,
     onClose: () -> Unit,
     onAmountChange: (String) -> Unit,
-    onRecipientChange: (String) -> Unit,
-    onRecipientConfirmChange: (String) -> Unit,
-    onScanQr: () -> Unit,
+    onCardUidChange: (String) -> Unit,
+    onCardUidConfirmChange: (String) -> Unit,
     onWrite: () -> Unit,
 ) {
     Column(
@@ -73,20 +85,23 @@ fun CardWriteScreen(
         ) {
             // Reader status — without a paired ESP32, this whole flow is dead.
             ReaderState(state.bond)
+            if (!state.online) {
+                Spacer(Modifier.height(8.dp))
+                OfflineBanner()
+            }
             Spacer(Modifier.height(20.dp))
 
-            val recipientLabel = when {
-                state.confirmedRecipient != null -> "✓ MATCHED"
-                state.typoMismatch               -> "✗ DOES NOT MATCH"
-                state.recipient.isBlank()        -> "REQUIRED"
-                else                             -> "RE-TYPE TO CONFIRM"
+            val uidLabel = when {
+                state.confirmedCardUid != null -> "✓ MATCHED"
+                state.typoMismatch             -> "✗ DOES NOT MATCH"
+                state.cardUid.isBlank()        -> "TYPE TWICE"
+                else                           -> "CONFIRM UID"
             }
-            SectionHeader("Recipient", recipientLabel)
-            RecipientCard(
+            SectionHeader("Card UID", uidLabel)
+            CardUidCard(
                 state = state,
-                onChange = onRecipientChange,
-                onChangeConfirm = onRecipientConfirmChange,
-                onScanQr = onScanQr,
+                onChange = onCardUidChange,
+                onChangeConfirm = onCardUidConfirmChange,
             )
             Spacer(Modifier.height(16.dp))
 
@@ -109,7 +124,8 @@ fun CardWriteScreen(
 
         Box(Modifier.fillMaxWidth().padding(16.dp)) {
             val canWrite = state.bond.isPaired &&
-                    state.confirmedRecipient != null &&
+                    state.confirmedCardUid != null &&
+                    state.online &&
                     !state.busy
             Surface(
                 onClick = { if (canWrite) onWrite() },
@@ -164,11 +180,10 @@ private fun ReaderState(bond: EspBondState) {
 }
 
 @Composable
-private fun RecipientCard(
+private fun CardUidCard(
     state: CardWriteState,
     onChange: (String) -> Unit,
     onChangeConfirm: (String) -> Unit,
-    onScanQr: () -> Unit,
 ) {
     Box(
         Modifier
@@ -178,55 +193,60 @@ private fun RecipientCard(
             .padding(16.dp)
     ) {
         Column {
-            MonoLabel("ENTER RECIPIENT 0x… ADDRESS")
+            Text(
+                "MIFARE / keyfob hardware UID printed on the card. " +
+                "4 or 7 bytes hex (e.g. 04A1B2C3 or 04A1B2C3D4E5F6). " +
+                "Spaces, dashes, colons OK.",
+                color = OffpayColors.InkSoft, fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(10.dp))
+            MonoLabel("CARD UID")
             Spacer(Modifier.height(6.dp))
             AddressBox(
-                value = state.recipient,
+                value = state.cardUid,
                 onChange = onChange,
-                placeholder = "0x…",
+                placeholder = "04A1B2C3…",
             )
             Spacer(Modifier.height(8.dp))
-            MonoLabel("RE-TYPE TO CONFIRM")
+            MonoLabel("RE-TYPE")
             Spacer(Modifier.height(6.dp))
             AddressBox(
-                value = state.recipientConfirm,
+                value = state.cardUidConfirm,
                 onChange = onChangeConfirm,
-                placeholder = "0x…",
+                placeholder = "04A1B2C3…",
                 outlineColor = when {
-                    state.confirmedRecipient != null -> OffpayColors.TealDeep
-                    state.typoMismatch               -> Color(0xFFB30E00)
-                    else                             -> OffpayColors.Hairline
+                    state.confirmedCardUid != null -> OffpayColors.TealDeep
+                    state.typoMismatch             -> Color(0xFFB30E00)
+                    else                           -> OffpayColors.Hairline
                 },
             )
-
             if (state.typoMismatch) {
                 Spacer(Modifier.height(6.dp))
-                Text("Addresses don't match — type the second one again or scan a QR.",
+                Text("UIDs don't match — re-type the second one carefully.",
                     color = Color(0xFFB30E00), fontSize = 12.sp)
             }
+        }
+    }
+}
 
-            Spacer(Modifier.height(12.dp))
-            Surface(
-                onClick = onScanQr,
-                shape = RoundedCornerShape(14.dp),
-                color = OffpayColors.OffWhite,
-                modifier = Modifier.height(42.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center,
-                    modifier = Modifier.padding(horizontal = 16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Icon(Icons.Outlined.QrCodeScanner, null, tint = OffpayColors.Ink,
-                            modifier = Modifier.size(16.dp))
-                        Text(
-                            if (state.confirmedRecipient != null) "Re-scan QR (overwrite)"
-                            else "Or scan recipient QR",
-                            color = OffpayColors.Ink, fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                }
-            }
+@Composable
+private fun OfflineBanner() {
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFFFE6E2))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Icon(Icons.Outlined.CloudOff, null,
+                tint = Color(0xFFB30E00), modifier = Modifier.size(16.dp))
+            Text(
+                "You need internet to write a card. The voucher is signed " +
+                "locally but we verify your locked-balance on chain first.",
+                color = Color(0xFFB30E00), fontSize = 12.sp,
+            )
         }
     }
 }
@@ -321,12 +341,14 @@ private fun HelpText() {
             .padding(14.dp)
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            MonoLabel("HOW WRITE WORKS")
+            MonoLabel("HOW BEARER CARDS WORK")
             Text(
-                "1. Phone signs a v3 voucher with the recipient address (no chain access).\n" +
-                "2. Phone sends a signed WRITE command to the bonded reader over BT.\n" +
-                "3. Reader verifies you're the owner, enters write mode, asks you to tap a card.\n" +
-                "4. JSON payload lands on the MIFARE; carry it to the merchant's stall.",
+                "1. You enter the card's UID twice + the amount (online — we check your locked balance).\n" +
+                "2. Your phone signs a true-bearer voucher (recipient = 0) bound to that UID.\n" +
+                "3. Voucher gets written to the MIFARE blocks via the bonded ESP32.\n" +
+                "4. Anyone holding the card can spend at any merchant. The merchant's reader signs an\n" +
+                "   endorsement at tap time committing to the merchant's primary wallet — that's who gets paid.\n" +
+                "5. The mesh relays the settle on chain. Card is now empty.",
                 color = OffpayColors.InkSoft, fontSize = 12.sp,
             )
         }

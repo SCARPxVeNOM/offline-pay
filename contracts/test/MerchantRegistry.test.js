@@ -1,12 +1,13 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
+// v3 voucher digest: includes recipient. MUST match OfflineVault.voucherDigest.
 function buildDigest(v, chainId, vaultAddr) {
   return ethers.solidityPackedKeccak256(
     ["bytes"],
     [ethers.AbiCoder.defaultAbiCoder().encode(
-      ["address","address","uint256","uint256","uint256","bytes32","uint256","address"],
-      [v.payer, v.merchant, v.amount, v.expiry, v.nonce, v.voucherId, chainId, vaultAddr]
+      ["address","address","address","uint256","uint256","uint256","bytes32","uint256","address"],
+      [v.payer, v.merchant, v.recipient, v.amount, v.expiry, v.nonce, v.voucherId, chainId, vaultAddr]
     )]
   );
 }
@@ -14,6 +15,7 @@ async function signVoucher(signer, v, chainId, vaultAddr) {
   const digest = buildDigest(v, chainId, vaultAddr);
   return signer.signMessage(ethers.getBytes(digest));
 }
+const tuple = (v) => [v.payer, v.merchant, v.recipient, v.amount, v.expiry, v.nonce, v.voucherId];
 
 describe("MerchantRegistry + device-keyed settlement", function () {
   let registry, vault, usdc, owner, payer, primary, devicePhone, deviceEsp32, attacker;
@@ -92,6 +94,7 @@ describe("MerchantRegistry + device-keyed settlement", function () {
     const v = {
       payer: payer.address,
       merchant: ethers.ZeroAddress,           // bearer
+      recipient: primary.address,             // v3: required field
       amount: 2n * ONE_USDC,
       expiry: Math.floor(Date.now()/1000) + 3600,
       nonce: 1,
@@ -101,7 +104,7 @@ describe("MerchantRegistry + device-keyed settlement", function () {
 
     const before = await usdc.balanceOf(primary.address);
     const beforeDev = await usdc.balanceOf(devicePhone.address);
-    await vault.connect(devicePhone).settleVoucherAsDevice(v, sig);
+    await vault.connect(devicePhone).settleVoucherAsDevice(tuple(v), sig);
 
     expect(await usdc.balanceOf(primary.address)).to.equal(before + v.amount);
     expect(await usdc.balanceOf(devicePhone.address)).to.equal(beforeDev); // device never holds funds
@@ -115,12 +118,12 @@ describe("MerchantRegistry + device-keyed settlement", function () {
 
     await vault.connect(payer).lockFunds(2n * ONE_USDC);
     const v = {
-      payer: payer.address, merchant: ethers.ZeroAddress,
+      payer: payer.address, merchant: ethers.ZeroAddress, recipient: primary.address,
       amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
       nonce: 1, voucherId: ethers.id("revoked"),
     };
     const sig = await signVoucher(payer, v, chainId, vaultAddr);
-    await expect(vault.connect(deviceEsp32).settleVoucherAsDevice(v, sig))
+    await expect(vault.connect(deviceEsp32).settleVoucherAsDevice(tuple(v), sig))
       .to.be.revertedWith("device not authorized");
   });
 
@@ -133,13 +136,13 @@ describe("MerchantRegistry + device-keyed settlement", function () {
     const vs = [], sigs = [];
     for (let i = 1; i <= 3; i++) {
       const v = {
-        payer: payer.address, merchant: ethers.ZeroAddress,
+        payer: payer.address, merchant: ethers.ZeroAddress, recipient: primary.address,
         amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
         nonce: i, voucherId: ethers.id("db"+i),
       };
       vs.push(v); sigs.push(await signVoucher(payer, v, chainId, vaultAddr));
     }
-    await vault.connect(devicePhone).settleBatchAsDevice(vs, sigs);
+    await vault.connect(devicePhone).settleBatchAsDevice(vs.map(tuple), sigs);
     expect(await usdc.balanceOf(primary.address)).to.equal(3n * ONE_USDC);
   });
 
@@ -148,12 +151,12 @@ describe("MerchantRegistry + device-keyed settlement", function () {
     const v2 = await Vault.deploy(await usdc.getAddress()); await v2.waitForDeployment();
 
     const v = {
-      payer: payer.address, merchant: ethers.ZeroAddress,
+      payer: payer.address, merchant: ethers.ZeroAddress, recipient: primary.address,
       amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
       nonce: 1, voucherId: ethers.id("noreg"),
     };
     const sig = await signVoucher(payer, v, chainId, await v2.getAddress());
-    await expect(v2.connect(devicePhone).settleVoucherAsDevice(v, sig))
+    await expect(v2.connect(devicePhone).settleVoucherAsDevice(tuple(v), sig))
       .to.be.revertedWith("registry unset");
   });
 });

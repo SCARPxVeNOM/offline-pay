@@ -87,6 +87,55 @@ class SettlementClient(
             txHash
         }
 
+    /// True-bearer settle, paid out to the merchant primary committed by
+    /// the ESP32 endorsement. Used for B2 cards where recipient = 0x0
+    /// and the merchant binding only happens at tap time.
+    ///
+    /// Reverts via the contract's existing checks if the voucher sig
+    /// doesn't match the payer, or the endorsement sig doesn't match
+    /// the device, or any of {voucher.recipient != 0, primary == 0,
+    /// expired, double-spend, insufficient locked} fail.
+    suspend fun settleBearerWithEndorsement(row: VoucherRow): String =
+        withContext(Dispatchers.IO) {
+            val device  = row.endorsementDevice  ?: error("missing endorsement device")
+            val primary = row.endorsementPrimary ?: error("missing endorsement primary")
+            val ts      = row.endorsementTs      ?: error("missing endorsement timestamp")
+            val esig    = row.endorsementSig     ?: error("missing endorsement signature")
+
+            val voucher  = voucherTuple(row)
+            val function = Function(
+                "settleBearerWithEndorsement",
+                listOf(
+                    voucher,
+                    DynamicBytes(Numeric.hexStringToByteArray(row.signature)),
+                    Address(device),
+                    Address(primary),
+                    Uint256(BigInteger.valueOf(ts)),
+                    DynamicBytes(Numeric.hexStringToByteArray(esig)),
+                ),
+                emptyList()
+            )
+            val data  = FunctionEncoder.encode(function)
+            val nonce = web3.ethGetTransactionCount(
+                fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.LATEST
+            ).send().transactionCount
+            val gasPrice = web3.ethGasPrice().send().gasPrice
+            val gasLimit = BigInteger.valueOf(500_000L)
+            val tx = RawTransaction.createTransaction(
+                nonce, gasPrice, gasLimit, vaultAddress, BigInteger.ZERO, data
+            )
+            val signed = TransactionEncoder.signMessage(
+                tx, chainId, org.web3j.crypto.Credentials.create(keyPair)
+            )
+            val resp = web3.ethSendRawTransaction(Numeric.toHexString(signed)).send()
+            if (resp.hasError()) error("submit failed: ${resp.error.message}")
+            val txHash = resp.transactionHash
+            val rcpt = waitForReceipt(txHash)
+                ?: error("settle tx not mined within 60s: $txHash")
+            if (rcpt.status != "0x1") error("settle reverted on chain: $txHash")
+            txHash
+        }
+
     /// Legacy fixed-merchant batch settle (msg.sender == merchant).
     suspend fun settleBatch(rows: List<VoucherRow>): String =
         withContext(Dispatchers.IO) {

@@ -5,10 +5,12 @@ import java.math.BigInteger
 object Config {
     // Polygon Amoy testnet.
     const val CHAIN_ID = 80002L
-    // v3 vault: Voucher struct includes `recipient` so anyone can broadcast
-    // settle without redirecting funds. Old vault addresses (v2) cannot be
-    // reused — digest changed.
-    const val VAULT_ADDRESS  = "0x2D8218329389545Cb12b37e2ED961BDB97d3661f"
+    // v3.1 vault: adds settleBearerWithEndorsement for true-bearer cards
+    // (recipient = 0x0, endorsed by an ESP32 reader at spend time). Old
+    // vault still works for the recipient-bound bearer path; in-place
+    // redeploy preserves USDC + registry. v3 vault was at
+    // 0x2D8218329389545Cb12b37e2ED961BDB97d3661f.
+    const val VAULT_ADDRESS  = "0x3E73aa7506c5a833E0842c948458af9d63C19dCd"
     const val USDC_ADDRESS   = "0x17ffe8373658Fb333530e4446becb19dB6239e1e"
 
     // OFFPAY backend on AWS EC2 (Sydney), dual-stack v4 + v6.

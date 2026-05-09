@@ -371,6 +371,28 @@ class HomeActivity : ComponentActivity() {
 
         try {
             runCatching { backend.init(keyVault.address, 0L) }
+            // Split: bearer-with-endorsement vouchers go through the
+            // dedicated contract path (one per tx — no batch helper for
+            // it yet); recipient-bound bearer vouchers continue through
+            // the existing settleBearerBatch.
+            val endorsed = pending.filter { it.endorsementSig != null }
+            for (row in endorsed) {
+                val tx = settle.settleBearerWithEndorsement(row)
+                received.markSettled(row.voucherId, tx)
+                WalletMesh.broadcastSettled(row.voucherId, tx)
+                balanceCache.markSettled(row.voucherId)
+                activity.recordSettled(listOf(row.voucherId), tx)
+                Log.i(TAG, "endorsed bearer settled: ${row.voucherId.take(10)} tx=${tx.take(10)}")
+            }
+            val recipientBound = pending.filter { it.endorsementSig == null }
+            if (recipientBound.isEmpty()) {
+                renderBalance()
+                state.value = state.value.copy(
+                    settleStatus = "⛓ settled ${endorsed.size} bearer voucher(s)")
+                return
+            }
+            // Below: existing recipient-bound batch path.
+            pending = recipientBound
             val tx = try {
                 settle.settleBearerBatch(pending)
             } catch (t: Throwable) {

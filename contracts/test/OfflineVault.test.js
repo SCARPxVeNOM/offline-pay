@@ -254,6 +254,122 @@ describe("OfflineVault (v3: recipient-bound)", function () {
     expect(await usdc.balanceOf(recipient.address)).to.equal(before + 3n * ONE_USDC);
   });
 
+  // ─── True-bearer + endorsement (B2: physical bearer cards) ─────────
+
+  // Build the endorsement digest exactly like OfflineVault.endorsementDigest.
+  function endorsementDigestJs(voucherId, device, primary, ts, chainId, vaultAddr) {
+    const domain = ethers.keccak256(ethers.toUtf8Bytes("OFFPAY-ENDORSE-V1"));
+    return ethers.solidityPackedKeccak256(
+      ["bytes"],
+      [ethers.AbiCoder.defaultAbiCoder().encode(
+        ["bytes32","bytes32","address","address","uint256","uint256","address"],
+        [domain, voucherId, device, primary, ts, chainId, vaultAddr]
+      )]
+    );
+  }
+  async function signEndorsement(deviceSigner, voucherId, primary, ts, chainId, vaultAddr) {
+    const d = endorsementDigestJs(voucherId, deviceSigner.address, primary, ts, chainId, vaultAddr);
+    return await deviceSigner.signMessage(ethers.getBytes(d));
+  }
+
+  it("endorsement: device endorses bearer voucher → primary gets paid", async function () {
+    // Setup: payer locks $3, signs a true-bearer voucher (recipient = 0).
+    await vault.connect(payer).lockFunds(3n * ONE_USDC);
+    const v = {
+      payer: payer.address,
+      merchant: ethers.ZeroAddress,
+      recipient: ethers.ZeroAddress,           // true bearer marker
+      amount: ONE_USDC,
+      expiry: Math.floor(Date.now()/1000) + 3600,
+      nonce: 1,
+      voucherId: ethers.id("endorse-happy"),
+    };
+    const voucherSig = await signVoucher(payer, v, chainId, vaultAddr);
+
+    // ESP32 (we use `merchantA` as the ESP32 device key) endorses, naming
+    // `recipient` as the merchant primary (the bonded phone's address).
+    const ts = Math.floor(Date.now()/1000);
+    const device = merchantA;             // pretending this signer is the ESP32
+    const merchantPrimary = recipient.address;
+    const espSig = await signEndorsement(device, v.voucherId, merchantPrimary, ts, chainId, vaultAddr);
+
+    const before = await usdc.balanceOf(merchantPrimary);
+    // `relay` (random unrelated wallet) broadcasts. Funds go to merchantPrimary.
+    await vault.connect(relay).settleBearerWithEndorsement(
+      tuple(v), voucherSig, device.address, merchantPrimary, ts, espSig);
+    expect(await usdc.balanceOf(merchantPrimary)).to.equal(before + v.amount);
+    expect(await usdc.balanceOf(relay.address)).to.equal(0n);
+  });
+
+  it("endorsement: rejects when voucher.recipient is non-zero", async function () {
+    await vault.connect(payer).lockFunds(ONE_USDC);
+    const v = {
+      payer: payer.address, merchant: ethers.ZeroAddress,
+      recipient: recipient.address,            // illegal for this path
+      amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
+      nonce: 1, voucherId: ethers.id("e-bad-recip"),
+    };
+    const voucherSig = await signVoucher(payer, v, chainId, vaultAddr);
+    const ts = Math.floor(Date.now()/1000);
+    const espSig = await signEndorsement(merchantA, v.voucherId, recipient.address, ts, chainId, vaultAddr);
+    await expect(vault.connect(relay).settleBearerWithEndorsement(
+      tuple(v), voucherSig, merchantA.address, recipient.address, ts, espSig))
+      .to.be.revertedWith("must be true bearer");
+  });
+
+  it("endorsement: rejects forged endorsement (different signer)", async function () {
+    await vault.connect(payer).lockFunds(ONE_USDC);
+    const v = {
+      payer: payer.address, merchant: ethers.ZeroAddress, recipient: ethers.ZeroAddress,
+      amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
+      nonce: 1, voucherId: ethers.id("e-forged"),
+    };
+    const voucherSig = await signVoucher(payer, v, chainId, vaultAddr);
+    const ts = Math.floor(Date.now()/1000);
+    // Signed by `attacker` but claiming to be `merchantA`.
+    const espSig = await signEndorsement(attacker, v.voucherId, recipient.address, ts, chainId, vaultAddr);
+    await expect(vault.connect(relay).settleBearerWithEndorsement(
+      tuple(v), voucherSig, merchantA.address, recipient.address, ts, espSig))
+      .to.be.revertedWith("bad endorsement sig");
+  });
+
+  it("endorsement: relay cannot redirect by tampering with primary", async function () {
+    // The endorsement signature commits to (voucherId, device, primary, ts).
+    // Swapping `primary` invalidates the device's signature.
+    await vault.connect(payer).lockFunds(ONE_USDC);
+    const v = {
+      payer: payer.address, merchant: ethers.ZeroAddress, recipient: ethers.ZeroAddress,
+      amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
+      nonce: 1, voucherId: ethers.id("e-redirect"),
+    };
+    const voucherSig = await signVoucher(payer, v, chainId, vaultAddr);
+    const ts = Math.floor(Date.now()/1000);
+    // ESP32 endorses the legitimate primary…
+    const espSig = await signEndorsement(merchantA, v.voucherId, recipient.address, ts, chainId, vaultAddr);
+    // …but the malicious relay submits with their own address as primary.
+    await expect(vault.connect(attacker).settleBearerWithEndorsement(
+      tuple(v), voucherSig, merchantA.address, attacker.address, ts, espSig))
+      .to.be.revertedWith("bad endorsement sig");
+  });
+
+  it("endorsement: blocks double-spend across both bearer paths", async function () {
+    await vault.connect(payer).lockFunds(ONE_USDC);
+    const v = {
+      payer: payer.address, merchant: ethers.ZeroAddress, recipient: ethers.ZeroAddress,
+      amount: ONE_USDC, expiry: Math.floor(Date.now()/1000)+3600,
+      nonce: 1, voucherId: ethers.id("e-double"),
+    };
+    const voucherSig = await signVoucher(payer, v, chainId, vaultAddr);
+    const ts = Math.floor(Date.now()/1000);
+    const espSig = await signEndorsement(merchantA, v.voucherId, recipient.address, ts, chainId, vaultAddr);
+
+    await vault.connect(relay).settleBearerWithEndorsement(
+      tuple(v), voucherSig, merchantA.address, recipient.address, ts, espSig);
+    await expect(vault.connect(relay).settleBearerWithEndorsement(
+      tuple(v), voucherSig, merchantA.address, recipient.address, ts, espSig))
+      .to.be.revertedWith("already settled");
+  });
+
   // ─── Generic ────────────────────────────────────────────────────
 
   it("unlock returns leftover funds", async function () {

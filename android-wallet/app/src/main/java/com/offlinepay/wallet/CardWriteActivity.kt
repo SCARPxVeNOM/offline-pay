@@ -1,10 +1,11 @@
 package com.offlinepay.wallet
 
-import android.content.Intent
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.lifecycleScope
@@ -16,41 +17,28 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import java.math.BigInteger
 
-/// "Top up card" — signs a v3 voucher with a chosen recipient and asks
-/// the bonded ESP32 to write it to the next-tapped MIFARE card.
+/// Top-up flow for true-bearer MIFARE cards.
 ///
-/// This is the second-layer entry point for sending: instead of an NFC
-/// tap or a QR transfer, the sender embeds the voucher into a physical
-/// card the customer can carry to a merchant stall. The merchant's
-/// reader (a different ESP32, paired to the merchant's phone) reads the
-/// card, the merchant phone receives the VOUCHER frame over BT, the
-/// mesh handles relay-settle. End-to-end offline.
+/// User flow: enter the card's hardware UID twice (typo guard) + amount;
+/// while online, the phone verifies its locked balance, signs a v3 voucher
+/// with `recipient = 0x0` (settled later via `settleBearerWithEndorsement`)
+/// + `cardUid = <user-typed>` as metadata, then sends a signed WRITE
+/// command to the bonded ESP32 which writes the JSON across MIFARE blocks
+/// 4-30 on the next-tapped card.
+///
+/// At spend time the merchant's reader signs an endorsement committing to
+/// its bonded primary wallet; the on-chain settle pays the primary, not
+/// whoever broadcasts. So the card is genuinely cash-like — anyone can
+/// spend it, but only at a merchant whose reader the customer actually
+/// taps.
 class CardWriteActivity : ComponentActivity() {
     private lateinit var keyVault: KeyVault
     private lateinit var bondStore: EspBondStore
     private lateinit var voucherSigner: VoucherSigner
     private lateinit var activityStore: ActivityStore
+    private lateinit var settle: SettlementClient
 
     private val ui = MutableStateFlow(CardWriteState())
-
-    private val qrLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { res ->
-        if (res.resultCode == RESULT_OK) {
-            val text = res.data?.getStringExtra("qr") ?: return@registerForActivityResult
-            // QR payload from ReceiveActivity is just the address. Tolerate
-            // a leading "ethereum:" prefix from external wallets too.
-            val addr = text.trim().removePrefix("ethereum:").trim()
-            if (addr.matches(Regex("^0x[0-9a-fA-F]{40}$"))) {
-                // Fill BOTH fields so the typo-guard goes green immediately;
-                // user already opted into "I trust the QR".
-                val low = addr.lowercase()
-                ui.value = ui.value.copy(recipient = low, recipientConfirm = low, error = null)
-            } else {
-                ui.value = ui.value.copy(error = "Scanned QR is not a 0x address: $text")
-            }
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -64,12 +52,17 @@ class CardWriteActivity : ComponentActivity() {
             payerAddress = keyVault.address,
             nonces       = NonceTracker(this),
         )
+        settle = SettlementClient(
+            rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
+            chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
+            fromAddress = keyVault.address,
+        )
 
-        // Reflect the current bond into UI so the screen shows whether a
-        // reader is even available.
+        // Bond + connectivity feed into UI state.
         lifecycleScope.launch {
             bondStore.stateFlow.collect { ui.value = ui.value.copy(bond = it) }
         }
+        ui.value = ui.value.copy(online = isOnline())
 
         setContent {
             OffpayTheme {
@@ -78,17 +71,23 @@ class CardWriteActivity : ComponentActivity() {
                     state = s,
                     onClose = { finish() },
                     onAmountChange = { ui.value = ui.value.copy(amount = it, error = null) },
-                    onRecipientChange = { ui.value = ui.value.copy(recipient = it, error = null) },
-                    onRecipientConfirmChange = {
-                        ui.value = ui.value.copy(recipientConfirm = it, error = null)
+                    onCardUidChange = {
+                        ui.value = ui.value.copy(cardUid = it, error = null)
                     },
-                    onScanQr = {
-                        qrLauncher.launch(Intent(this, QrScanActivity::class.java))
+                    onCardUidConfirmChange = {
+                        ui.value = ui.value.copy(cardUidConfirm = it, error = null)
                     },
                     onWrite = { writeCard() },
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Re-check online state on resume so toggling Wi-Fi off/on flips
+        // the offline banner without leaving the screen.
+        ui.value = ui.value.copy(online = isOnline())
     }
 
     private fun writeCard() {
@@ -98,11 +97,18 @@ class CardWriteActivity : ComponentActivity() {
             ui.value = s.copy(error = "Pair an ESP32 reader first (Home → Reader)")
             return
         }
-        val recipient = s.confirmedRecipient
+        if (!isOnline()) {
+            ui.value = s.copy(
+                online = false,
+                error = "Internet required: we verify your locked balance before signing.",
+            )
+            return
+        }
+        val cardUid = s.confirmedCardUid
             ?: run {
                 ui.value = s.copy(
-                    error = if (s.typoMismatch) "Recipient addresses don't match — re-type to confirm"
-                            else "Enter the recipient address twice (or scan a QR)",
+                    error = if (s.typoMismatch) "Card UIDs don't match — re-type carefully"
+                            else "Enter the card UID twice (8 or 14 hex chars)",
                 )
                 return
             }
@@ -111,21 +117,41 @@ class CardWriteActivity : ComponentActivity() {
             ui.value = s.copy(error = "Enter an amount in USDC")
             return
         }
-        ui.value = s.copy(busy = true, status = "Signing voucher…",
-            statusKind = StatusKind.Working, error = null)
+
+        ui.value = s.copy(
+            busy = true, error = null,
+            status = "Checking locked balance…", statusKind = StatusKind.Working,
+        )
 
         lifecycleScope.launch {
-            val signed = voucherSigner.signNext(
-                merchant = null,                          // bearer-shape (recipient holds binding)
-                recipient = recipient,
+            // Verify locked balance covers the new card amount. We don't
+            // factor in already-issued card balances here (that lives in
+            // ActivityStore + BalanceCache) — the chain's lockedBalance
+            // is the hard ceiling.
+            val locked = runCatching { settle.lockedBalance(keyVault.address) }.getOrNull()
+            if (locked == null) {
+                ui.value = ui.value.copy(busy = false, status = "Network error",
+                    statusKind = StatusKind.Error,
+                    error = "Couldn't reach chain — try again on a stronger network.")
+                return@launch
+            }
+            if (locked < BigInteger.valueOf(amountBaseUnits)) {
+                ui.value = ui.value.copy(busy = false, status = "Insufficient locked",
+                    statusKind = StatusKind.Error,
+                    error = "Locked balance is ${"%.2f".format(locked.toLong() / 1e6)}; " +
+                            "top up before writing this card.")
+                return@launch
+            }
+
+            ui.value = ui.value.copy(status = "Signing voucher…")
+            val signed = voucherSigner.signNextBearerForCard(
                 amountUsdc = BigInteger.valueOf(amountBaseUnits),
-                ttlSeconds = 24 * 3600L,                  // 24h — long enough for cards
+                ttlSeconds = 24 * 3600L,
             )
-            val voucherJson = signed.toCardJson()
+            val voucherJson = signed.toCardJson(cardUid = cardUid)
 
             ui.value = ui.value.copy(
                 status = "Tap MIFARE card on the reader…",
-                statusKind = StatusKind.Working,
             )
             when (val r = EspWriteClient.writeVoucherToCard(
                 bondedBtMac = bond.btMac,
@@ -135,7 +161,7 @@ class CardWriteActivity : ComponentActivity() {
                 is EspWriteClient.Result.Written -> {
                     activityStore.recordSent(
                         voucherId = signed.voucherId,
-                        recipient = recipient,
+                        recipient = "card:$cardUid",
                         amountBaseUnits = amountBaseUnits,
                     )
                     val pretty = "%.2f".format(amountBaseUnits / 1e6)
@@ -156,6 +182,13 @@ class CardWriteActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun isOnline(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val net = cm.activeNetwork ?: return false
+        val cap = cm.getNetworkCapabilities(net) ?: return false
+        return cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     private fun parseUsdc(text: String): Long? = try {

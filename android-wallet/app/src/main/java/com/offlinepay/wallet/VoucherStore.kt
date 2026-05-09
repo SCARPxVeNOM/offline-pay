@@ -27,6 +27,18 @@ data class VoucherRow(
     val settledTx: String?,
     val replicaCount: Int = 0,
     val replicaPeers: String = "[]",
+    /// MIFARE / keyfob hardware UID this voucher was bound to at top-up
+    /// time. Set on bearer cards; null for HCE / NFC-tap flows.
+    val cardUid: String? = null,
+    /// On a true-bearer (recipient = 0) voucher, the merchant's reader
+    /// signed an endorsement at tap time. These four fields persist that
+    /// endorsement on the row so a later autoSettle (e.g. when the
+    /// merchant's phone reconnects) can call settleBearerWithEndorsement
+    /// without needing the ESP32 in the loop again.
+    val endorsementTs: Long? = null,
+    val endorsementPrimary: String? = null,
+    val endorsementDevice: String? = null,
+    val endorsementSig: String? = null,
 )
 
 /// Pre-signed bearer vouchers loaded onto this phone at topup time. Each
@@ -119,7 +131,7 @@ interface ActivityDao {
 
 @Database(
     entities = [VoucherRow::class, UnspentRow::class, ActivityRow::class],
-    version = 5, exportSchema = false,
+    version = 6, exportSchema = false,
 )
 abstract class VoucherDb : RoomDatabase() {
     abstract fun voucherDao(): VoucherDao
@@ -142,13 +154,18 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
     override fun exists(id: String): Boolean = dao.exists(id)
     suspend fun get(id: String): VoucherRow? = dao.get(id)
 
-    suspend fun saveAccepted(v: Voucher) {
+    suspend fun saveAccepted(v: Voucher, endorsement: Endorsement? = null) {
         dao.insert(VoucherRow(
             voucherId = v.voucherId, payer = v.payer, merchant = v.merchant, recipient = v.recipient,
             amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
             signature = v.signature,
             status = "accepted", rejectReason = null,
             acceptedAtMs = System.currentTimeMillis(), settledTx = null,
+            cardUid = v.cardUid,
+            endorsementTs       = endorsement?.timestamp,
+            endorsementPrimary  = endorsement?.merchantPrimary,
+            endorsementDevice   = endorsement?.deviceAddress,
+            endorsementSig      = endorsement?.signature,
         ))
     }
 

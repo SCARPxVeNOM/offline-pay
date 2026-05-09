@@ -213,6 +213,11 @@ String address() {
   return toHex(s_address, 20, true);
 }
 
+void addressBytes(uint8_t out20[20]) {
+  if (!s_ready) { memset(out20, 0, 20); return; }
+  memcpy(out20, s_address, 20);
+}
+
 String publicKeyHex() {
   if (!s_ready) return String("");
   return toHex(s_pub, 65, false);
