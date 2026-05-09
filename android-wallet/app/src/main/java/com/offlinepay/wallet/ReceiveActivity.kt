@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.offlinepay.wallet.ui.OffpayTheme
 import com.offlinepay.wallet.ui.ReceiveScreen
 import com.offlinepay.wallet.ui.ReceiveState
@@ -38,6 +39,7 @@ class ReceiveActivity : ComponentActivity() {
     private lateinit var activity: ActivityStore
     private lateinit var settle: SettlementClient
     private lateinit var reader: ReaderModeLoop
+    private var btBridge: BluetoothBridge? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val state = MutableStateFlow(
@@ -87,6 +89,20 @@ class ReceiveActivity : ComponentActivity() {
             },
             onError = { msg -> state.value = state.value.copy(status = msg, statusKind = StatusKind.Error) }
         )
+
+        // ESP32 Bluetooth bridge (merchant receive via reader hardware).
+        btBridge = try {
+            BluetoothBridge(this, scope = lifecycleScope).also { bt ->
+                lifecycleScope.launch {
+                    bt.vouchers.collect { v ->
+                        walletScope.launch { handleIncomingVoucher(v) }
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "BT bridge init skipped: ${t.message}")
+            null
+        }
 
         val qrBitmap = com.offlinepay.wallet.Qr.render(keyVault.address, size = 600)
 
@@ -138,6 +154,29 @@ class ReceiveActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private suspend fun handleIncomingVoucher(v: Voucher) {
+        val result = verifier.verify(v)
+        Log.d(TAG, "BT verify ${v.voucherId.take(10)} -> $result")
+        if (result == VerifyResult.VALID) {
+            store.saveAccepted(v)
+            activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())
+            btBridge?.sendDecision(true)
+            val amt = "%.2f".format(v.amount.toDouble() / 1e6)
+            state.value = state.value.copy(
+                status = "received $amt USDC via ESP32",
+                statusKind = StatusKind.Success,
+            )
+        } else {
+            store.saveRejected(v, result.name)
+            btBridge?.sendDecision(false)
+            state.value = state.value.copy(
+                status = "BT voucher rejected: ${result.name}",
+                statusKind = StatusKind.Error,
+            )
+        }
+        if (isOnline()) tryAutoSettle()
     }
 
     private suspend fun handleIncoming(wireJson: String) {
@@ -280,6 +319,7 @@ class ReceiveActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         reader.start()
+        btBridge?.connect()
         registerNetCallback()
         if (isOnline()) walletScope.launch { tryAutoSettle() }
     }
@@ -287,6 +327,7 @@ class ReceiveActivity : ComponentActivity() {
     override fun onPause() {
         unregisterNetCallback()
         reader.stop()
+        btBridge?.close()
         super.onPause()
     }
 

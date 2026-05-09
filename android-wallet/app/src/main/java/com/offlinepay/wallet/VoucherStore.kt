@@ -18,10 +18,12 @@ data class VoucherRow(
     val expiry: Long,
     val nonce: Long,
     val signature: String,
-    val status: String,        // accepted | settled | rejected
+    val status: String,        // accepted | settled | rejected | replica
     val rejectReason: String?,
     val acceptedAtMs: Long,
     val settledTx: String?,
+    val replicaCount: Int = 0,
+    val replicaPeers: String = "[]",
 )
 
 /// Pre-signed bearer vouchers loaded onto this phone at topup time. Each
@@ -63,7 +65,7 @@ interface VoucherDao {
     @Query("SELECT * FROM vouchers ORDER BY acceptedAtMs DESC LIMIT 100")
     fun recent(): Flow<List<VoucherRow>>
 
-    @Query("SELECT * FROM vouchers WHERE status='accepted' LIMIT 50")
+    @Query("SELECT * FROM vouchers WHERE status='accepted' OR status='replica' LIMIT 50")
     suspend fun pendingForSettle(): List<VoucherRow>
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
@@ -74,6 +76,9 @@ interface VoucherDao {
 
     @Query("UPDATE vouchers SET status='rejected', rejectReason=:reason WHERE voucherId=:id")
     suspend fun markRejected(id: String, reason: String)
+
+    @Query("UPDATE vouchers SET replicaCount=:count, replicaPeers=:peers WHERE voucherId=:id")
+    suspend fun updateReplication(id: String, count: Int, peers: String)
 }
 
 @Dao
@@ -108,7 +113,7 @@ interface ActivityDao {
 
 @Database(
     entities = [VoucherRow::class, UnspentRow::class, ActivityRow::class],
-    version = 3, exportSchema = false,
+    version = 4, exportSchema = false,
 )
 abstract class VoucherDb : RoomDatabase() {
     abstract fun voucherDao(): VoucherDao
@@ -155,6 +160,31 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
     suspend fun markSettled(id: String, tx: String) = dao.markSettled(id, tx)
     suspend fun markRejected(id: String, reason: String) = dao.markRejected(id, reason)
     fun recent(): Flow<List<VoucherRow>> = dao.recent()
+
+    suspend fun saveReplica(v: Voucher) {
+        dao.insert(VoucherRow(
+            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant,
+            amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
+            signature = v.signature,
+            status = "replica", rejectReason = null,
+            acceptedAtMs = System.currentTimeMillis(), settledTx = null,
+        ))
+    }
+
+    suspend fun recordReplicaAck(voucherId: String, peerId: String) {
+        val row = dao.get(voucherId) ?: return
+        val peers = parsePeers(row.replicaPeers).toMutableSet()
+        if (peers.add(peerId)) {
+            dao.updateReplication(voucherId, peers.size, encodePeers(peers))
+        }
+    }
+
+    private fun parsePeers(json: String): Set<String> =
+        json.trim().removePrefix("[").removeSuffix("]")
+            .split(",").map { it.trim().trim('"') }.filter { it.isNotEmpty() }.toSet()
+
+    private fun encodePeers(peers: Set<String>): String =
+        peers.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }
 }
 
 /// Unified activity feed store. Consumers call `record*` from any side
@@ -238,4 +268,10 @@ class UnspentStore(ctx: Context) {
         }
         return null
     }
+}
+
+fun confidenceLevel(replicaCount: Int): String = when {
+    replicaCount >= 3 -> "HIGH ($replicaCount backups)"
+    replicaCount >= 1 -> "MEDIUM ($replicaCount backup${if (replicaCount == 1) "" else "s"})"
+    else              -> "LOW (no backup yet)"
 }

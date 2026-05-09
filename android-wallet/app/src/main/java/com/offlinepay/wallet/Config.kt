@@ -23,4 +23,13 @@ object Config {
     const val EXPLORER_BASE = "https://amoy.polygonscan.com"
     fun txUrl(hash: String) = "$EXPLORER_BASE/tx/$hash"
     fun addressUrl(addr: String) = "$EXPLORER_BASE/address/$addr"
+
+    // Mesh (Nearby Connections)
+    const val MESH_SERVICE_ID  = "com.offlinepay.wallet.mesh"
+    const val CLAIM_WAIT_MS    = 5_000L
+    const val CLAIM_BACKOFF_MS = 30_000L
+
+    // Bluetooth SPP (ESP32 reader)
+    const val BT_DEVICE_NAME   = "OfflinePay_Reader"
+    val BT_SPP_UUID: java.util.UUID = java.util.UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 }

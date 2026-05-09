@@ -69,6 +69,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Nearby Connections (mesh replication between merchant peers).
+    implementation("com.google.android.gms:play-services-nearby:19.3.0")
+
     // Web3j: secp256k1, EIP-191, JSON-RPC, ABI encoding.
     implementation("org.web3j:core:4.12.2")
     // No-op slf4j binding so HttpService.<clinit> doesn't NoClassDefFoundError at runtime.

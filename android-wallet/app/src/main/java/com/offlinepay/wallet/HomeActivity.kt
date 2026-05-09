@@ -1,15 +1,18 @@
 package com.offlinepay.wallet
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,9 +38,15 @@ class HomeActivity : ComponentActivity() {
     private lateinit var backend: BackendClient
     private lateinit var activity: ActivityStore
     private lateinit var settle: SettlementClient
+    private lateinit var mesh: MeshBroadcaster
+    private lateinit var handshake: HandshakeManager
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val state = MutableStateFlow(DashState())
+
+    private val meshPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* mesh.start() will retry once granted */ }
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -50,6 +59,24 @@ class HomeActivity : ComponentActivity() {
             chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
             fromAddress = keyVault.address
         )
+
+        // Mesh replication (merchant-role feature).
+        val registryGate: (String) -> Boolean = { false } // fail-closed; production fills from RPC poll
+        handshake = HandshakeManager(
+            keyPair = keyVault.keyPair,
+            selfAddress = keyVault.address,
+            isRegisteredDevice = registryGate,
+        )
+        val meshVerifier = VoucherVerifier(
+            Config.CHAIN_ID, Config.VAULT_ADDRESS, Config.MAX_SINGLE_USDC,
+            received, expectedRecipient = "0x0000000000000000000000000000000000000000"
+        )
+        mesh = MeshBroadcaster(
+            ctx = this, store = received, verifier = meshVerifier,
+            deviceId = keyVault.address,
+            isRegisteredDevice = registryGate,
+            handshake = handshake,
+        ).also { it.selfAddress = keyVault.address }
 
         state.value = state.value.copy(walletAddress = keyVault.address)
 
@@ -92,10 +119,29 @@ class HomeActivity : ComponentActivity() {
                 )
             }
         }
+        // Broadcast newly-accepted vouchers on the mesh for replication.
+        lifecycleScope.launch {
+            val seenIds = mutableSetOf<String>()
+            received.recent().collect { rows ->
+                for (row in rows) {
+                    if (row.status == "accepted" && seenIds.add(row.voucherId)) {
+                        val v = Voucher(
+                            voucherId = row.voucherId, payer = row.payer,
+                            merchant = row.merchant, amount = BigInteger(row.amount),
+                            expiry = row.expiry, nonce = row.nonce, signature = row.signature,
+                        )
+                        mesh.broadcast(v)
+                    }
+                }
+                state.value = state.value.copy(meshPeerCount = mesh.peerCount)
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
+        mesh.start()
+        ensureMeshPermissions()
         registerNetCallback()
         if (isOnline()) {
             homeScope.launch {
@@ -112,6 +158,7 @@ class HomeActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        mesh.stop()
         unregisterNetCallback()
         super.onPause()
     }
@@ -130,6 +177,22 @@ class HomeActivity : ComponentActivity() {
         }
         var pending = all.filter { it.merchant == ZERO }
         if (pending.isEmpty()) return
+
+        // Claim-before-settle: announce intent on the mesh and drop any
+        // voucher a peer has claimed first.
+        val claimed = mutableListOf<VoucherRow>()
+        for (v in pending) {
+            if (mesh.claimAndWait(v.voucherId)) claimed += v
+        }
+        val meshSkipped = pending.size - claimed.size
+        pending = claimed
+        if (meshSkipped > 0) {
+            Log.i(TAG, "mesh claim: skipped $meshSkipped claimed by peers")
+        }
+        if (pending.isEmpty()) {
+            state.value = state.value.copy(settleStatus = "all claimed by mesh peers — backing off")
+            return
+        }
 
         // Pre-flight: drop any voucher whose payer has insufficient locked funds.
         // This avoids broadcasting a tx that's guaranteed to revert.
@@ -224,6 +287,16 @@ class HomeActivity : ComponentActivity() {
         val net = cm.activeNetwork ?: return false
         val cap = cm.getNetworkCapabilities(net) ?: return false
         return cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun ensureMeshPermissions() {
+        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 31) {
+            perms += Manifest.permission.BLUETOOTH_CONNECT
+            perms += Manifest.permission.BLUETOOTH_SCAN
+            perms += Manifest.permission.NEARBY_WIFI_DEVICES
+        }
+        meshPermLauncher.launch(perms.toTypedArray())
     }
 
     companion object { private const val TAG = "OfflinePay/Home" }

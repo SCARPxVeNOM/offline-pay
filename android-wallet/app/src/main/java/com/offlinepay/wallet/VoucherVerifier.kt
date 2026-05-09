@@ -48,6 +48,28 @@ class VoucherVerifier(
         }
     }
 
+    /// Verify for mesh replication — same as verify() but does NOT enforce
+    /// bearer-only or recipient checks. Any voucher with a valid signature,
+    /// non-expired, non-duplicate, within-limit is accepted.
+    fun verifyForMesh(v: Voucher): VerifyResult {
+        if (System.currentTimeMillis() / 1000 > v.expiry)         return VerifyResult.EXPIRED
+        if (v.amount > maxSinglePayment)                          return VerifyResult.EXCEEDS_LIMIT
+        if (voucherStore.exists(v.voucherId))                     return VerifyResult.ALREADY_SEEN
+
+        return try {
+            val digest = voucherDigest(v)
+            val signedDigest = ethSignedMessageHash(digest)
+            val sig = parseSignature(v.signature)
+            val recoveredPubKey: BigInteger =
+                Sign.signedMessageHashToKey(signedDigest, sig)
+            val recoveredAddress = "0x" + Keys.getAddress(recoveredPubKey)
+            if (recoveredAddress.equals(v.payer, ignoreCase = true)) VerifyResult.VALID
+            else VerifyResult.BAD_SIGNATURE
+        } catch (t: Throwable) {
+            VerifyResult.BAD_SIGNATURE
+        }
+    }
+
     /// keccak256(abi.encode(payer, merchant, amount, expiry, nonce,
     ///                      voucherId, chainId, vault))
     private fun voucherDigest(v: Voucher): ByteArray {

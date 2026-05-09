@@ -30,6 +30,7 @@ data class ReceiveState(
     val statusKind: StatusKind = StatusKind.Idle,
     val recent: List<RecentRow> = emptyList(),
     val pendingCount: Int = 0,
+    val btConnected: Boolean = false,
 )
 
 @Composable
@@ -87,6 +88,24 @@ fun ReceiveScreen(
             Spacer(Modifier.height(16.dp))
 
             StatusLine(state.status, state.statusKind)
+            if (state.btConnected) {
+                Spacer(Modifier.height(8.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(OffpayColors.TealSoft)
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        PulseDot(size = 6.dp)
+                        MonoLabel("ESP32 READER CONNECTED", color = OffpayColors.TealDeep)
+                    }
+                }
+            }
             Spacer(Modifier.height(12.dp))
 
             if (state.pendingCount > 0) {

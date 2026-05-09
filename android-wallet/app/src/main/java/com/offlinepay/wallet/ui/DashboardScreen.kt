@@ -36,6 +36,7 @@ data class DashState(
     val syncedSecondsAgo: Int? = null,
     val settleStatus: String? = null,
     val recent: List<RecentRow> = emptyList(),
+    val meshPeerCount: Int = 0,
 )
 
 data class RecentRow(
@@ -93,6 +94,7 @@ fun DashboardScreen(
             TapHero(onSend = onSend, onReceive = onReceive)
             if (state.settleStatus != null) SettleBanner(state.settleStatus, onSettleNow)
             if (state.pendingCount > 0) PendingBanner(state.pendingCount, state.pendingUsdc, onSettleNow)
+            if (state.meshPeerCount > 0) MeshStatusBanner(state.meshPeerCount)
             SectionHeader("Quick actions", "View all ›")
             QuickActions(onTopup = onTopup, onBackup = onBackup, onHistory = onHistory)
             SectionHeader("Recent activity", "See all ›")
@@ -444,6 +446,33 @@ private fun PendingBanner(count: Int, totalUsdc: String, onSettleNow: () -> Unit
                 MonoLabel("\$$totalUsdc · TAPPED OFFLINE")
             }
             Icon(Icons.Outlined.ChevronRight, null, tint = OffpayColors.TealDeep)
+        }
+    }
+}
+
+@Composable
+private fun MeshStatusBanner(peerCount: Int) {
+    Box(
+        Modifier
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(OffpayColors.OffWhite)
+            .border(1.dp, OffpayColors.Hairline, RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(Icons.Outlined.Hub, null, tint = OffpayColors.TealDeep, modifier = Modifier.size(16.dp))
+            Column {
+                Text(
+                    "Mesh: $peerCount peer${if (peerCount == 1) "" else "s"} connected",
+                    color = OffpayColors.Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                )
+                MonoLabel("P2P BACKUP ACTIVE")
+            }
         }
     }
 }
