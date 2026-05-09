@@ -10,11 +10,11 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
-/// Talks to the OfflinePay backend over HTTP. The phone never opens an
-/// Ethereum RPC connection in custodial mode — backend is the only thing
-/// that touches Polygon. All requests are idempotent at the contract layer
-/// (voucherId uniqueness, mint/lock under backend's wallet).
-class BackendClient(private val baseUrl: String) {
+/// Talks to the OfflinePay backend over HTTP. Reads the base URL from
+/// `Config.BACKEND_BASE` on every request so a runtime flip by
+/// BackendResolver (v4 ↔ v6) propagates without recreating clients.
+class BackendClient(initialBaseUrl: String = Config.BACKEND_BASE) {
+    private val baseUrl: String get() = Config.BACKEND_BASE
     // 5-minute call timeout: Amoy testnet txs are slow (~5-10s each) and a
     // topup does mint + approve + lock + sign-batch serialized via the
     // backend's chain mutex. Several stacked requests can take minutes.

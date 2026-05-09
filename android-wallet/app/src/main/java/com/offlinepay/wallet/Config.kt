@@ -3,20 +3,27 @@ package com.offlinepay.wallet
 import java.math.BigInteger
 
 object Config {
-    // Polygon Amoy testnet defaults. Replace with deployment outputs.
-    // For local Hardhat testing on phones over LAN: 31337L + LAN URL.
+    // Polygon Amoy testnet.
     const val CHAIN_ID = 80002L
     const val VAULT_ADDRESS  = "0x30b01f8e5Ed5E3b958f0009019fd3f3b9b5d6cE5"
     const val USDC_ADDRESS   = "0x03Ad909F2b68328ED1606dDD894816978A0CE7a1"
 
-    // RPC unused on the phone in custodial mode — backend does all chain ops.
-    const val RPC_URL        = "https://polygon-amoy.infura.io/v3/63a92704fd4c46b5957bf6a6764f21d2"
+    // OFFPAY backend on AWS EC2 (Sydney), dual-stack v4 + v6.
+    // Phone networks vary: Airtel/Jio LTE = IPv6-only, home Wi-Fi = IPv4-only.
+    // BackendResolver.kt picks whichever URL responds first at startup so
+    // the app works on either flavor of network without configuration.
+    val BACKEND_CANDIDATES = listOf(
+        "http://[2406:da1c:f46:b001:a8e8:aa05:48d4:2a44]",  // IPv6 (works on Airtel/Jio LTE)
+        "http://16.176.155.145"                              // IPv4 (works on home Wi-Fi)
+    )
+    /// Default — overridden at runtime by BackendResolver. Pre-fill with v4
+    /// because most Wi-Fi tests will hit it first.
+    @Volatile var BACKEND_BASE: String = BACKEND_CANDIDATES[1]
 
-    // OFFPAY backend hosted on AWS EC2 (Sydney, ap-southeast-2). Public over
-    // HTTP for now — phones connect over Wi-Fi/4G with no USB tether.
-    // For local testing use `http://10.0.2.2:4000` (emulator) or
-    // `http://127.0.0.1:4000` with `adb reverse tcp:4000 tcp:4000`.
-    const val BACKEND_BASE   = "http://16.176.155.145:4000"
+    // RPC goes through backend's /rpc proxy. Computed dynamically because
+    // BACKEND_BASE is var — the resolver may flip it between v4 / v6 at
+    // startup based on which network the phone is on.
+    val RPC_URL: String get() = "$BACKEND_BASE/rpc"
 
     val MAX_SINGLE_USDC: BigInteger = BigInteger("2000000")  // $2.00, matches contract
     const val DEFAULT_TTL_SECONDS    = 24L * 3600
