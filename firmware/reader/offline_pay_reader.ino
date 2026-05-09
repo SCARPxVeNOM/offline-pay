@@ -629,10 +629,8 @@ void onWrite(const String& line) {
 
   // Wait for a card and write the JSON. Visual cue: solid green.
   // Reset dedup so a card already on the reader (which the loop
-  // recently skipped) can be picked up here without waiting for the
-  // dedup window to elapse.
+  // recently skipped) can be picked up here.
   s_lastUid = "";
-  s_lastUidMs = 0;
   digitalWrite(LED_GREEN, HIGH);
   Serial.print("[write] waiting up to ");
   Serial.print(WRITE_WAIT_MS / 1000);
