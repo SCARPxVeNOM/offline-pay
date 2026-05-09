@@ -33,6 +33,7 @@ fun SendScreen(
     statusKind: StatusKind,
     onArm: () -> Unit,
     onClose: () -> Unit,
+    onWriteCard: (() -> Unit)? = null,
 ) {
     Column(
         Modifier
@@ -102,6 +103,32 @@ fun SendScreen(
                          color = if (armed) OffpayColors.InkSoft else Color.White,
                          fontSize = 16.sp, fontWeight = FontWeight.Bold,
                          letterSpacing = 0.5.sp)
+                }
+            }
+        }
+        // Secondary action — write a voucher to a MIFARE card via the
+        // bonded ESP32 reader. Visible when the activity wires it; null
+        // when the user hasn't paired a reader yet.
+        if (onWriteCard != null) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+            ) {
+                Surface(
+                    onClick = onWriteCard,
+                    shape = RoundedCornerShape(20.dp),
+                    color = OffpayColors.OffWhite,
+                    modifier = Modifier.fillMaxWidth().height(54.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Row(verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Outlined.CreditCard, null, tint = OffpayColors.Ink)
+                            Text("Write to MIFARE card", color = OffpayColors.Ink,
+                                fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
             }
         }

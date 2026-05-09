@@ -47,6 +47,7 @@
         <activity android:name=".BackupRestoreActivity" android:exported="false" />
         <activity android:name=".QrScanActivity" android:exported="false" />
         <activity android:name=".EspActivity" android:exported="false" />
+        <activity android:name=".CardWriteActivity" android:exported="false" />
 
         <service
             android:name=".HceVoucherService"

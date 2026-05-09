@@ -19,6 +19,12 @@ class BluetoothBridge(
     private val ctx: Context,
     private val deviceName: String = Config.BT_DEVICE_NAME,
     private val scope: CoroutineScope,
+    /// Optional owner gate. When non-null, only VOUCHER frames whose
+    /// ESP32-address prefix matches the bonded reader are emitted —
+    /// anyone within BT range advertising the same `OfflinePay_Reader`
+    /// name can no longer slip frames into our store. Disabled (null)
+    /// for backward compatibility with code that hasn't paired yet.
+    private val bondStore: EspBondStore? = null,
 ) {
     private val _vouchers = MutableSharedFlow<Voucher>(extraBufferCapacity = 16)
     val vouchers: SharedFlow<Voucher> = _vouchers
@@ -72,10 +78,30 @@ class BluetoothBridge(
             val trimmed = line.trim()
             if (!trimmed.startsWith("VOUCHER ")) return null
             val parts = trimmed.split(" ", limit = 4)
-            val jsonText = when {
-                parts.size == 4 && parts[1].startsWith("0x") -> parts[3]
-                parts.size >= 3                              -> parts[2]
-                else                                         -> return null
+            val readerAddr: String?
+            val jsonText: String
+            when {
+                parts.size == 4 && parts[1].startsWith("0x") -> {
+                    readerAddr = parts[1].lowercase()
+                    jsonText   = parts[3]
+                }
+                parts.size >= 3 -> {
+                    readerAddr = null  // legacy frame, no reader identity
+                    jsonText   = parts[2]
+                }
+                else -> return null
+            }
+            // Owner gate. If we have a bonded reader, frames must come
+            // from THAT reader (matched by the firmware's wallet
+            // address printed at the start of the frame). Legacy frames
+            // without an address are dropped on the bonded path.
+            val bond = bondStore?.current()
+            if (bond != null && bond.isPaired) {
+                if (readerAddr == null || readerAddr != bond.espAddress) {
+                    Log.w(TAG, "drop voucher from unbonded reader $readerAddr (paired=${bond.espAddress})")
+                    return null
+                }
+                bondStore.touchLastSeen()
             }
             val payload = json.decodeFromString(CardVoucherPayload.serializer(), jsonText)
             Voucher.fromCardPayload(payload)

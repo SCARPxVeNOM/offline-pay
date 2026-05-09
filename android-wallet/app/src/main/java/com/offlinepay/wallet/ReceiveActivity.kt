@@ -95,7 +95,7 @@ class ReceiveActivity : ComponentActivity() {
 
         // ESP32 Bluetooth bridge (merchant receive via reader hardware).
         btBridge = try {
-            BluetoothBridge(this, scope = lifecycleScope).also { bt ->
+            BluetoothBridge(this, scope = lifecycleScope, bondStore = EspBondStore(this)).also { bt ->
                 lifecycleScope.launch {
                     bt.vouchers.collect { v ->
                         walletScope.launch { handleIncomingVoucher(v) }

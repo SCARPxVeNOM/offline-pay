@@ -1,5 +1,6 @@
 package com.offlinepay.wallet
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -40,12 +41,14 @@ class SendActivity : ComponentActivity() {
             }
         }
 
+        val bondStore = EspBondStore(this)
         setContent {
             OffpayTheme {
                 val a by amount.collectAsState()
                 val ar by armed.collectAsState()
                 val st by status.collectAsState()
                 val sk by statusKind.collectAsState()
+                val bond by bondStore.stateFlow.collectAsState()
                 SendScreen(
                     amount = a,
                     onAmountChange = { amount.value = it },
@@ -54,6 +57,12 @@ class SendActivity : ComponentActivity() {
                     statusKind = sk,
                     onArm = { onArm() },
                     onClose = { finish() },
+                    // Card-write path is only meaningful when a reader is
+                    // paired. Otherwise the button would lead the user
+                    // into an immediate "no reader paired" error.
+                    onWriteCard = if (bond.isPaired) {
+                        { startActivity(Intent(this, CardWriteActivity::class.java)) }
+                    } else null,
                 )
             }
         }
