@@ -10,6 +10,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -65,9 +66,11 @@ class ReceiveActivity : ComponentActivity() {
         super.onCreate(s)
         keyVault = KeyVault(this)
         store    = VoucherStore(this)
+        // v3: voucher's `recipient` field is signed by the payer; verifier
+        // accepts only vouchers addressed to this device's wallet.
         verifier = VoucherVerifier(
             Config.CHAIN_ID, Config.VAULT_ADDRESS, Config.MAX_SINGLE_USDC,
-            store, expectedRecipient = "0x0000000000000000000000000000000000000000"
+            store, expectedRecipient = keyVault.address,
         )
         backend  = BackendClient(Config.BACKEND_BASE)
         activity = ActivityStore(this)
@@ -154,6 +157,44 @@ class ReceiveActivity : ComponentActivity() {
                 )
             }
         }
+        // Mirror Home's mesh observability on the Receive screen so the
+        // receiver can see the relay path firing while the sender is taps
+        // away. peer count drives the status line; events become toasts.
+        walletScope.launch {
+            WalletMesh.peerCountFlow.collect { n ->
+                state.value = state.value.copy(meshPeerCount = n)
+            }
+        }
+        lifecycleScope.launch {
+            WalletMesh.events.collect { ev ->
+                showMeshToast(ev)
+                // For the receiver, settlement-by-relay is THE moment
+                // worth showing. Promote it to the prominent status
+                // line so the user sees it without scrolling, with the
+                // explorer link wired through `recent` once the row's
+                // settledTx column is populated by the mesh handler.
+                if (ev is MeshEvent.SettledByPeer) {
+                    state.value = state.value.copy(
+                        status = "⛓ settled by relay — tx ${ev.txHash.take(10)}…",
+                        statusKind = StatusKind.Success,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun showMeshToast(ev: MeshEvent) {
+        // Same surface as Home — keep the receiver screen quiet so the
+        // user only sees real progress (peer found, relay settled).
+        val text = when (ev) {
+            is MeshEvent.PeerConnected     -> if (ev.total == 1) "🔗 mesh peer in range" else null
+            is MeshEvent.VoucherBroadcast  -> if (ev.peerCount > 0)
+                "📤 voucher gossiped to ${ev.peerCount} peer${if (ev.peerCount == 1) "" else "s"}"
+                else null
+            is MeshEvent.SettledByPeer     -> "✓ settled by relay — tx ${ev.txHash.take(10)}…"
+            else -> null
+        } ?: return
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
     }
 
     private suspend fun handleIncomingVoucher(v: Voucher) {
@@ -162,6 +203,9 @@ class ReceiveActivity : ComponentActivity() {
         if (result == VerifyResult.VALID) {
             store.saveAccepted(v)
             activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())
+            // Gossip to mesh peers so a third (online) device can relay-settle
+            // even if both sender and receiver stay offline. No-op if no peers.
+            WalletMesh.broadcast(v)
             btBridge?.sendDecision(true)
             val amt = "%.2f".format(v.amount.toDouble() / 1e6)
             state.value = state.value.copy(
@@ -196,6 +240,7 @@ class ReceiveActivity : ComponentActivity() {
             if (result == VerifyResult.VALID) {
                 store.saveAccepted(v)
                 activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())
+                WalletMesh.broadcast(v)
                 totalAccepted += v.amount.toDouble() / 1e6
             } else {
                 store.saveRejected(v, result.name)
@@ -224,10 +269,31 @@ class ReceiveActivity : ComponentActivity() {
             store.markRejected(it.voucherId, "NOT_BEARER")
             activity.recordFailed("Non-bearer voucher rejected")
         }
-        var pending = all.filter { it.merchant == ZERO }
-        Log.d(TAG, "tryAutoSettle pending=${pending.size} force=$force")
-        if (pending.isEmpty()) {
+        val bearerOnly = all.filter { it.merchant == ZERO }
+        Log.d(TAG, "tryAutoSettle pending=${bearerOnly.size} force=$force peers=${WalletMesh.peerCount}")
+        if (bearerOnly.isEmpty()) {
             if (force) state.value = state.value.copy(status = "nothing to settle", statusKind = StatusKind.Idle)
+            return
+        }
+
+        // Same role split as HomeActivity. The Receive screen sees its own
+        // accepted vouchers; if a mesh peer is connected, the peer holds
+        // the replica and is the relay — we defer. If no peer, settle
+        // ourselves (we're the only path). `force=true` (manual "Settle
+        // Now") always proceeds so the user can override.
+        val accepted = bearerOnly.filter { it.status == "accepted" }
+        val replicas = bearerOnly.filter { it.status == "replica" }
+        var pending = if (!force && WalletMesh.peerCount > 0) replicas else (replicas + accepted)
+        if (pending.isEmpty()) {
+            if (accepted.isNotEmpty()) {
+                Log.i(TAG, "deferring ${accepted.size} voucher(s) to ${WalletMesh.peerCount} relay peer(s)")
+                state.value = state.value.copy(
+                    status = "${accepted.size} pending — relay will settle",
+                    statusKind = StatusKind.Working,
+                )
+            } else if (force) {
+                state.value = state.value.copy(status = "nothing to settle", statusKind = StatusKind.Idle)
+            }
             return
         }
 
@@ -285,7 +351,10 @@ class ReceiveActivity : ComponentActivity() {
                 } else throw t
             }
             Log.d(TAG, "settle tx=$tx")
-            pending.forEach { store.markSettled(it.voucherId, tx) }
+            pending.forEach {
+                store.markSettled(it.voucherId, tx)
+                WalletMesh.broadcastSettled(it.voucherId, tx)
+            }
             activity.recordSettled(pending.map { it.voucherId }, tx)
             state.value = state.value.copy(status = "⛓ settled ${pending.size} — tx ${tx.take(10)}…",
                 statusKind = StatusKind.Success)
@@ -318,6 +387,10 @@ class ReceiveActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Keep mesh alive on this screen too — otherwise vouchers we accept
+        // here can't be replicated to peers, and a third online device has
+        // nothing to relay.
+        WalletMesh.acquire(this)
         reader.start()
         btBridge?.connect()
         registerNetCallback()
@@ -328,6 +401,7 @@ class ReceiveActivity : ComponentActivity() {
         unregisterNetCallback()
         reader.stop()
         btBridge?.close()
+        WalletMesh.release()
         super.onPause()
     }
 

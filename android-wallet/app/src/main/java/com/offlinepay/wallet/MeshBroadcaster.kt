@@ -8,12 +8,36 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.concurrent.ConcurrentHashMap
+
+/// User-visible mesh state transitions. Emitted on a SharedFlow so activities
+/// can show toasts/badges and the user can see the relay actually doing work.
+sealed class MeshEvent {
+    data class PeerConnected(val endpointId: String, val total: Int) : MeshEvent()
+    data class PeerDisconnected(val endpointId: String, val total: Int) : MeshEvent()
+    data class VoucherBroadcast(val voucherId: String, val peerCount: Int) : MeshEvent()
+    data class ReplicaStored(val voucherId: String, val from: String) : MeshEvent()
+    data class ReplicaRejected(val voucherId: String, val reason: String) : MeshEvent()
+    data class ClaimSent(val voucherId: String, val peerCount: Int) : MeshEvent()
+    data class ClaimReceived(val voucherId: String, val from: String) : MeshEvent()
+    /// Relay (or any other peer) settled on chain and told us about it.
+    /// Used by the offline recipient to flip its UI from "pending settle"
+    /// to "settled · tx 0x…" without ever touching the chain itself.
+    data class SettledByPeer(val voucherId: String, val txHash: String) : MeshEvent()
+    data class AdvertiseFailed(val reason: String) : MeshEvent()
+    data class DiscoverFailed(val reason: String) : MeshEvent()
+}
 
 /// Mesh replication over Nearby Connections (BLE + WiFi-Direct).
 ///
@@ -44,6 +68,49 @@ class MeshBroadcaster(
     private val connected = mutableSetOf<String>()
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
+    /// Maps endpointId → handshake-verified peer address. Lets us dedupe
+    /// the peer count by address: Nearby Connections gives a fresh
+    /// endpointId per medium (BLE, BT-Classic, Wi-Fi LAN, Wi-Fi Direct),
+    /// so the same physical phone can show up two or three times in
+    /// `connected`. Counting by address gives the user a number that
+    /// matches reality (1 nearby phone = "1 peer").
+    private val endpointAddress = ConcurrentHashMap<String, String>()
+    /// voucherId → set of peer addresses we've received an ACK from. We
+    /// stop retrying once the set is non-empty (any single peer holding
+    /// the replica is sufficient for the demo).
+    private val ackedBy = ConcurrentHashMap<String, MutableSet<String>>()
+    /// voucherIds we've seen a "settled" message for. Prevents duplicate
+    /// SettledByPeer events when multiple peers broadcast settlement
+    /// (e.g. relay + a backup that also tried).
+    private val seenSettled: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /// voucherId → Voucher we still need to gossip. Drained as ACKs arrive
+    /// and as new peers connect. This is the durable retry queue that
+    /// papers over Nearby Connections' silent payload drops on flaky
+    /// channels (BLE-only handshake without a Wi-Fi/BT-classic upgrade).
+    private val pendingBroadcast = ConcurrentHashMap<String, Voucher>()
+
+    private val _peerCountFlow = MutableStateFlow(0)
+    /// Live peer count. Updated synchronously on every connect/disconnect so
+    /// the UI's mesh-status pill reflects reality without polling.
+    val peerCountFlow: StateFlow<Int> = _peerCountFlow.asStateFlow()
+
+    /// SharedFlow of human-meaningful mesh state transitions. Replay=0,
+    /// extraBufferCapacity is generous so tryEmit() never drops on a busy
+    /// gossip burst. Activities collect this to drive toasts.
+    private val _events = MutableSharedFlow<MeshEvent>(replay = 0, extraBufferCapacity = 64)
+    val events: SharedFlow<MeshEvent> = _events.asSharedFlow()
+
+    /// True peer count = unique handshake-verified addresses. Falls back
+    /// to raw endpoint count for endpoints we haven't verified yet, so
+    /// the badge updates immediately on connection (handshake takes a
+    /// few hundred ms more).
+    private fun computePeerCount(): Int {
+        val verified = endpointAddress.values.toSet().size
+        val unverified = connected.count { it !in endpointAddress.keys }
+        return verified + unverified
+    }
+    private fun publishPeerCount() { _peerCountFlow.value = computePeerCount() }
+
     /// voucherId → wall-clock millis at which the most recent SETTLEMENT_CLAIM
     /// from a peer was observed. Local settle calls back off until this
     /// expires.
@@ -51,7 +118,7 @@ class MeshBroadcaster(
 
     @Serializable
     private data class MeshMessage(
-        // "replica" | "ack" | "claim" | "challenge" | "response"
+        // "replica" | "ack" | "claim" | "settled" | "challenge" | "response"
         @SerialName("type") val type: String,
         @SerialName("voucherId") val voucherId: String = "",
         @SerialName("payload") val payload: CardVoucherPayload? = null,
@@ -63,6 +130,10 @@ class MeshBroadcaster(
         @SerialName("nonceB64") val nonceB64: String? = null,
         /// RESPONSE: 65-byte ECDSA signature (hex) over keccak256(nonce we sent).
         @SerialName("sig") val signatureHex: String? = null,
+        /// SETTLED: on-chain settlement tx hash. Carried so the recipient
+        /// can deep-link straight to the explorer without ever needing
+        /// internet itself.
+        @SerialName("txHash") val txHash: String? = null,
     )
 
     /// Address of THIS device — placed in every outbound message so peers can
@@ -76,11 +147,33 @@ class MeshBroadcaster(
     fun start() {
         val opts = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
         client.startAdvertising(deviceId, Config.MESH_SERVICE_ID, lifecycle, opts)
-            .addOnFailureListener { Log.w(TAG, "advertise failed: $it") }
+            .addOnFailureListener {
+                Log.w(TAG, "advertise failed: $it")
+                _events.tryEmit(MeshEvent.AdvertiseFailed(it.message ?: it.javaClass.simpleName))
+            }
 
         val dopts = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
         client.startDiscovery(Config.MESH_SERVICE_ID, discovery, dopts)
-            .addOnFailureListener { Log.w(TAG, "discover failed: $it") }
+            .addOnFailureListener {
+                Log.w(TAG, "discover failed: $it")
+                _events.tryEmit(MeshEvent.DiscoverFailed(it.message ?: it.javaClass.simpleName))
+            }
+
+        // Retry pump. Without it, a payload that silently fails on the
+        // initial broadcast (Nearby's payload upgrade fails on a thin
+        // BLE-only channel) is gone forever — Samsung says "broadcast"
+        // but Nothing never sees the replica. Re-broadcasting every few
+        // seconds gives the channel time to upgrade or for a stronger
+        // peer to come into range.
+        scope.launch {
+            while (true) {
+                delay(3_000)
+                if (pendingBroadcast.isEmpty() || connected.isEmpty()) continue
+                val snapshot = pendingBroadcast.values.toList()
+                Log.i(TAG, "retry broadcast: ${snapshot.size} unacked voucher(s) → ${connected.size} endpoint(s)")
+                for (v in snapshot) sendReplicaTo(connected.toList(), v)
+            }
+        }
     }
 
     fun stop() {
@@ -88,16 +181,52 @@ class MeshBroadcaster(
         client.stopAdvertising()
         client.stopDiscovery()
         connected.clear()
+        endpointAddress.clear()
+        publishPeerCount()
     }
 
     /// Broadcast a freshly-accepted voucher to every connected mesh peer.
     /// Each peer that stores it will reply with an ACK; replicaCount goes
     /// up as ACKs come in.
     fun broadcast(v: Voucher) {
-        if (connected.isEmpty()) {
-            Log.i(TAG, "broadcast: no peers — voucher ${v.voucherId} has no backups")
+        // Always queue. Even if no peer is connected right now, a peer
+        // might come into range in seconds; the retry pump will deliver
+        // it. If we already have an ACK, this is a no-op.
+        if (ackedBy[v.voucherId]?.isNotEmpty() == true) return
+        pendingBroadcast[v.voucherId] = v
+
+        val targets = connected.toList()
+        if (targets.isEmpty()) {
+            Log.i(TAG, "broadcast: no peers yet for ${v.voucherId} — queued for retry")
+            _events.tryEmit(MeshEvent.VoucherBroadcast(v.voucherId, 0))
             return
         }
+        sendReplicaTo(targets, v)
+        Log.i(TAG, "broadcast voucher ${v.voucherId} → ${targets.size} endpoint(s); queued for retry until acked")
+        _events.tryEmit(MeshEvent.VoucherBroadcast(v.voucherId, targets.size))
+    }
+
+    /// Tell every connected peer that voucherId has been settled on chain
+    /// with txHash. The recipient (offline phone) uses this to flip its
+    /// "pending settle" UI to "settled · tx 0x…" without ever needing
+    /// internet itself. Idempotent: peers dedupe via seenSettled.
+    fun broadcastSettled(voucherId: String, txHash: String) {
+        seenSettled.add(voucherId)  // we settled it ourselves; suppress
+                                     // any echo from a peer
+        if (connected.isEmpty()) {
+            Log.d(TAG, "broadcastSettled: no peers — skipping (recipient already in pending state)")
+            return
+        }
+        val msg = MeshMessage(type = "settled", voucherId = voucherId,
+                              fromAddress = selfAddress, txHash = txHash)
+        val payload = Payload.fromBytes(json.encodeToString(msg).toByteArray())
+        for (endpointId in connected) {
+            client.sendPayload(endpointId, payload)
+        }
+        Log.i(TAG, "broadcastSettled ${voucherId.take(10)} tx=${txHash.take(10)} → ${connected.size} endpoint(s)")
+    }
+
+    private fun sendReplicaTo(endpoints: List<String>, v: Voucher) {
         val msg = MeshMessage(
             type = "replica",
             voucherId = v.voucherId,
@@ -110,10 +239,11 @@ class MeshBroadcaster(
             fromAddress = selfAddress,
         )
         val payload = Payload.fromBytes(json.encodeToString(msg).toByteArray())
-        connected.forEach { endpointId ->
+        for (endpointId in endpoints) {
             client.sendPayload(endpointId, payload)
+                .addOnSuccessListener { Log.d(TAG, "sent replica ${v.voucherId.take(10)} → $endpointId OK") }
+                .addOnFailureListener { Log.w(TAG, "sendPayload $endpointId failed: ${it.message}") }
         }
-        Log.i(TAG, "broadcast voucher ${v.voucherId} → ${connected.size} peers")
     }
 
     private val discovery = object : EndpointDiscoveryCallback() {
@@ -122,7 +252,10 @@ class MeshBroadcaster(
                 .addOnFailureListener { Log.w(TAG, "request $endpointId failed: $it") }
         }
         override fun onEndpointLost(endpointId: String) {
-            connected.remove(endpointId)
+            if (connected.remove(endpointId)) {
+                publishPeerCount()
+                _events.tryEmit(MeshEvent.PeerDisconnected(endpointId, connected.size))
+            }
         }
     }
 
@@ -133,7 +266,10 @@ class MeshBroadcaster(
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
                 connected.add(endpointId)
-                Log.i(TAG, "peer connected: $endpointId (${connected.size} total)")
+                publishPeerCount()
+                val n = computePeerCount()
+                Log.i(TAG, "peer connected: $endpointId (${connected.size} endpoint(s), $n unique)")
+                _events.tryEmit(MeshEvent.PeerConnected(endpointId, n))
                 // Kick off the handshake: send a fresh CHALLENGE nonce.
                 handshake?.let { hs ->
                     val nonce = hs.newChallengeNonce(endpointId)
@@ -141,10 +277,23 @@ class MeshBroadcaster(
                     val out = Payload.fromBytes(json.encodeToString(msg).toByteArray())
                     client.sendPayload(endpointId, out)
                 }
+                // Drain the pending-broadcast queue to this fresh peer.
+                // Critical for the relay use case: the relay (Nothing) often
+                // joins AFTER the receiver (Samsung) has already accepted
+                // a voucher, so without this we'd never push the backlog.
+                val pending = pendingBroadcast.values.toList()
+                if (pending.isNotEmpty()) {
+                    Log.i(TAG, "draining ${pending.size} pending voucher(s) to fresh peer $endpointId")
+                    for (v in pending) sendReplicaTo(listOf(endpointId), v)
+                }
             }
         }
         override fun onDisconnected(endpointId: String) {
-            connected.remove(endpointId)
+            if (connected.remove(endpointId)) {
+                endpointAddress.remove(endpointId)
+                publishPeerCount()
+                _events.tryEmit(MeshEvent.PeerDisconnected(endpointId, computePeerCount()))
+            }
             handshake?.forget(endpointId)
         }
     }
@@ -180,6 +329,13 @@ class MeshBroadcaster(
                 val claimed = msg.fromAddress ?: return
                 val sig = msg.signatureHex ?: return
                 hs.verifyResponse(endpointId, claimed, sig)
+                // Track endpoint→address. Lets us dedupe peer count
+                // across the multiple endpointIds Nearby creates per
+                // medium for the same physical phone.
+                hs.verifiedAddress(endpointId)?.let { addr ->
+                    endpointAddress[endpointId] = addr.lowercase()
+                    publishPeerCount()
+                }
                 return
             }
         }
@@ -203,6 +359,7 @@ class MeshBroadcaster(
                 if (storeIt) {
                     store.saveReplica(v)
                     Log.i(TAG, "stored replica ${v.voucherId} from $endpointId")
+                    _events.tryEmit(MeshEvent.ReplicaStored(v.voucherId, endpointId))
                 }
                 if (ackIt) {
                     val ack = MeshMessage(
@@ -212,6 +369,7 @@ class MeshBroadcaster(
                     client.sendPayload(endpointId, out)
                 } else {
                     Log.w(TAG, "rejected mesh replica ${v.voucherId}: $verdict")
+                    _events.tryEmit(MeshEvent.ReplicaRejected(v.voucherId, verdict.name))
                 }
             }
             "ack" -> {
@@ -221,6 +379,11 @@ class MeshBroadcaster(
                 // endpoint id so ACKs are still distinct per peer.
                 val peerKey = handshake?.verifiedAddress(endpointId) ?: endpointId
                 store.recordReplicaAck(msg.voucherId, peerKey)
+                // Stop retrying — at least one peer holds a copy now.
+                ackedBy.getOrPut(msg.voucherId) { mutableSetOf() }.add(peerKey)
+                if (pendingBroadcast.remove(msg.voucherId) != null) {
+                    Log.i(TAG, "ack from $peerKey for ${msg.voucherId} — removing from retry queue")
+                }
             }
             "claim" -> {
                 // Another device is about to settle this voucher. Back off so
@@ -228,6 +391,19 @@ class MeshBroadcaster(
                 val deadline = System.currentTimeMillis() + Config.CLAIM_BACKOFF_MS
                 claimedUntil[msg.voucherId] = deadline
                 Log.i(TAG, "peer ${msg.fromAddress ?: endpointId} claimed ${msg.voucherId} — backing off ${Config.CLAIM_BACKOFF_MS}ms")
+                _events.tryEmit(MeshEvent.ClaimReceived(msg.voucherId, msg.fromAddress ?: endpointId))
+            }
+            "settled" -> {
+                // Relay (or any peer) settled on chain. Update our local
+                // row and surface a single, polite toast — even if we were
+                // offline at settle time. Idempotent across multiple peers
+                // re-broadcasting the same news.
+                val tx = msg.txHash ?: return
+                if (!seenSettled.add(msg.voucherId)) return
+                store.markSettled(msg.voucherId, tx)
+                pendingBroadcast.remove(msg.voucherId)
+                Log.i(TAG, "peer ${msg.fromAddress ?: endpointId} settled ${msg.voucherId.take(10)} tx=${tx.take(10)}")
+                _events.tryEmit(MeshEvent.SettledByPeer(msg.voucherId, tx))
             }
         }
     }
@@ -245,6 +421,7 @@ class MeshBroadcaster(
             val claim = MeshMessage(type = "claim", voucherId = voucherId, fromAddress = selfAddress)
             val payload = Payload.fromBytes(json.encodeToString(claim).toByteArray())
             connected.forEach { client.sendPayload(it, payload) }
+            _events.tryEmit(MeshEvent.ClaimSent(voucherId, connected.size))
         }
         delay(waitMs)
 

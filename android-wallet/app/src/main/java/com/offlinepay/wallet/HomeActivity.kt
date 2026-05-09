@@ -10,6 +10,7 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,8 +39,6 @@ class HomeActivity : ComponentActivity() {
     private lateinit var backend: BackendClient
     private lateinit var activity: ActivityStore
     private lateinit var settle: SettlementClient
-    private lateinit var mesh: MeshBroadcaster
-    private lateinit var handshake: HandshakeManager
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val state = MutableStateFlow(DashState())
@@ -59,24 +58,6 @@ class HomeActivity : ComponentActivity() {
             chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
             fromAddress = keyVault.address
         )
-
-        // Mesh replication (merchant-role feature).
-        val registryGate: (String) -> Boolean = { false } // fail-closed; production fills from RPC poll
-        handshake = HandshakeManager(
-            keyPair = keyVault.keyPair,
-            selfAddress = keyVault.address,
-            isRegisteredDevice = registryGate,
-        )
-        val meshVerifier = VoucherVerifier(
-            Config.CHAIN_ID, Config.VAULT_ADDRESS, Config.MAX_SINGLE_USDC,
-            received, expectedRecipient = "0x0000000000000000000000000000000000000000"
-        )
-        mesh = MeshBroadcaster(
-            ctx = this, store = received, verifier = meshVerifier,
-            deviceId = keyVault.address,
-            isRegisteredDevice = registryGate,
-            handshake = handshake,
-        ).also { it.selfAddress = keyVault.address }
 
         state.value = state.value.copy(walletAddress = keyVault.address)
 
@@ -120,28 +101,67 @@ class HomeActivity : ComponentActivity() {
             }
         }
         // Broadcast newly-accepted vouchers on the mesh for replication.
+        // We re-broadcast every existing accepted row on each tick to cover
+        // the case where a peer joined AFTER the row was first inserted —
+        // mesh.broadcast is a no-op when there are no peers, so it's safe.
+        // Also kick auto-settle whenever a `replica` row appears: this is
+        // how a relay device picks up vouchers received via mesh from an
+        // offline pair and pushes settle on their behalf.
         lifecycleScope.launch {
-            val seenIds = mutableSetOf<String>()
+            var lastReplicaIds = emptySet<String>()
             received.recent().collect { rows ->
                 for (row in rows) {
-                    if (row.status == "accepted" && seenIds.add(row.voucherId)) {
+                    if (row.status == "accepted") {
                         val v = Voucher(
                             voucherId = row.voucherId, payer = row.payer,
                             merchant = row.merchant, recipient = row.recipient,
                             amount = BigInteger(row.amount),
                             expiry = row.expiry, nonce = row.nonce, signature = row.signature,
                         )
-                        mesh.broadcast(v)
+                        WalletMesh.broadcast(v)
                     }
                 }
-                state.value = state.value.copy(meshPeerCount = mesh.peerCount)
+                val replicaIds = rows.filter { it.status == "replica" }.map { it.voucherId }.toSet()
+                val newReplicas = replicaIds - lastReplicaIds
+                lastReplicaIds = replicaIds
+                if (newReplicas.isNotEmpty()) {
+                    Log.d(TAG, "mesh delivered ${newReplicas.size} new replica(s) — kicking autoSettle")
+                    autoSettleIfOnline()
+                }
             }
         }
+        // Live mesh peer count → state. Drives the always-visible mesh
+        // status banner; without this collect, the banner reads 0 forever
+        // even when a peer is connected.
+        lifecycleScope.launch {
+            WalletMesh.peerCountFlow.collect { n ->
+                state.value = state.value.copy(meshPeerCount = n)
+            }
+        }
+        // Toast on every observable mesh transition. The user can SEE the
+        // relay path firing on each phone — no more "is mesh even running?"
+        // guessing.
+        lifecycleScope.launch {
+            WalletMesh.events.collect { ev -> showMeshToast(ev) }
+        }
+    }
+
+    private fun showMeshToast(ev: MeshEvent) {
+        // Trimmed surface — only the milestones a user actually cares
+        // about. Everything else stays in logcat for diagnostics.
+        val text = when (ev) {
+            is MeshEvent.PeerConnected     -> if (ev.total == 1) "🔗 mesh peer connected" else null
+            is MeshEvent.ReplicaStored     -> "📥 voucher arrived via mesh"
+            is MeshEvent.SettledByPeer     -> "✓ relay settled — tx ${ev.txHash.take(10)}…"
+            is MeshEvent.AdvertiseFailed   -> "mesh advertise failed: ${ev.reason}"
+            else -> null
+        } ?: return
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
     }
 
     override fun onResume() {
         super.onResume()
-        mesh.start()
+        WalletMesh.acquire(this)
         ensureMeshPermissions()
         registerNetCallback()
         refreshChainBalance()
@@ -189,7 +209,7 @@ class HomeActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        mesh.stop()
+        WalletMesh.release()
         unregisterNetCallback()
         super.onPause()
     }
@@ -206,24 +226,70 @@ class HomeActivity : ComponentActivity() {
             received.markRejected(it.voucherId, "NOT_BEARER")
             activity.recordFailed("Non-bearer voucher rejected")
         }
-        var pending = all.filter { it.merchant == ZERO }
-        if (pending.isEmpty()) return
+        val bearerOnly = all.filter { it.merchant == ZERO }
+        if (bearerOnly.isEmpty()) return
 
-        // Claim-before-settle: announce intent on the mesh and drop any
-        // voucher a peer has claimed first.
-        val claimed = mutableListOf<VoucherRow>()
-        for (v in pending) {
-            if (mesh.claimAndWait(v.voucherId)) claimed += v
-        }
-        val meshSkipped = pending.size - claimed.size
-        pending = claimed
-        if (meshSkipped > 0) {
-            Log.i(TAG, "mesh claim: skipped $meshSkipped claimed by peers")
-        }
+        // Role split. Vouchers I received via NFC live as `accepted`; vouchers
+        // a peer broadcast to me over the mesh live as `replica`. They are
+        // for the SAME on-chain voucher but represent different roles —
+        // recipient vs relay. If both roles try to settle, we get the dual-
+        // claim deadlock observed in the logs (each side back-offs on the
+        // other's claim, voucher never settles).
+        //
+        // New rule:
+        //   - Replicas (relay role) — always settle when online. This is
+        //     literally the relay's job.
+        //   - Accepted (recipient role) — settle only if NO peer is
+        //     connected (we're the only path). If a peer is around, defer:
+        //     the peer is the more-likely-online relay.
+        //
+        // This eliminates the deadlock without giving up correctness — the
+        // contract's usedVouchers mapping is still the safety net if both
+        // roles ever did broadcast.
+        val accepted = bearerOnly.filter { it.status == "accepted" }
+        val replicas = bearerOnly.filter { it.status == "replica" }
+        var pending = if (WalletMesh.peerCount > 0) replicas else (replicas + accepted)
         if (pending.isEmpty()) {
-            state.value = state.value.copy(settleStatus = "all claimed by mesh peers — backing off")
+            if (accepted.isNotEmpty()) {
+                Log.i(TAG, "deferring ${accepted.size} accepted voucher(s) to ${WalletMesh.peerCount} relay peer(s)")
+                state.value = state.value.copy(
+                    settleStatus = "${accepted.size} pending — relay will settle",
+                )
+            }
             return
         }
+
+        // Reachability probe. Android can report a network as "online" when
+        // it has a default route but no actual path to our backend (joined
+        // a captive Wi-Fi, or the network is IPv6-only and the host's IPv4
+        // is unreachable). lockedBalance is a cheap RPC; if it can't even
+        // get out, settling will fail with ENETUNREACH after a long
+        // timeout. If we're alone, retry later. If a mesh peer is
+        // connected, defer entirely — the relay (an actually-online phone)
+        // will settle.
+        val rpcReachable = runCatching { settle.lockedBalance(keyVault.address) }
+            .onFailure { Log.w(TAG, "rpc probe failed: ${it.message}") }
+            .isSuccess
+        if (!rpcReachable) {
+            if (WalletMesh.peerCount > 0) {
+                Log.i(TAG, "rpc unreachable, deferring ${pending.size} voucher(s) to ${WalletMesh.peerCount} mesh peer(s)")
+                state.value = state.value.copy(
+                    settleStatus = "no internet — ${WalletMesh.peerCount} relay will settle",
+                )
+            } else {
+                Log.i(TAG, "rpc unreachable, no mesh peers — will retry later")
+                state.value = state.value.copy(settleStatus = "offline — will retry")
+            }
+            return
+        }
+
+        // No claim-and-wait. The role split above means the relay is the
+        // only one trying to settle for any given voucher, so claim
+        // negotiation has nothing to negotiate. We were observing live
+        // deadlocks from stale claim messages (asymmetric peer visibility,
+        // residual state from prior test runs). If multiple relays ever
+        // race, the contract's `usedVouchers` mapping rejects the loser —
+        // wasted gas, but no deadlock and no double-settle.
 
         // Pre-flight: drop any voucher whose payer has insufficient locked funds.
         // This avoids broadcasting a tx that's guaranteed to revert.
@@ -274,7 +340,14 @@ class HomeActivity : ComponentActivity() {
                     resp.tx ?: error("relay returned no tx")
                 } else throw t
             }
-            pending.forEach { received.markSettled(it.voucherId, tx) }
+            pending.forEach {
+                received.markSettled(it.voucherId, tx)
+                // Tell the offline recipient that their voucher landed.
+                // No-op if we have no peers; harmless if we settled an
+                // accepted row of our own (we'd just echo to ourselves
+                // which the dedup set drops).
+                WalletMesh.broadcastSettled(it.voucherId, tx)
+            }
             activity.recordSettled(pending.map { it.voucherId }, tx)
             state.value = state.value.copy(settleStatus = "⛓ settled ${pending.size} — tx ${tx.take(10)}…")
             // Refresh balances now that chain state changed.
@@ -327,6 +400,11 @@ class HomeActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 31) {
             perms += Manifest.permission.BLUETOOTH_CONNECT
             perms += Manifest.permission.BLUETOOTH_SCAN
+            // BLUETOOTH_ADVERTISE is required for the relay device — it has
+            // to advertise so offline peers can discover it. Without this
+            // grant, Nearby Connections returns ApiException 8038 from
+            // startAdvertising and the relay can only act as discoverer.
+            perms += Manifest.permission.BLUETOOTH_ADVERTISE
             perms += Manifest.permission.NEARBY_WIFI_DEVICES
         }
         meshPermLauncher.launch(perms.toTypedArray())

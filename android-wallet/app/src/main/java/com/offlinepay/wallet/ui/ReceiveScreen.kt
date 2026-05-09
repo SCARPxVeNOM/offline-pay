@@ -31,6 +31,7 @@ data class ReceiveState(
     val recent: List<RecentRow> = emptyList(),
     val pendingCount: Int = 0,
     val btConnected: Boolean = false,
+    val meshPeerCount: Int = 0,
 )
 
 @Composable
@@ -106,6 +107,8 @@ fun ReceiveScreen(
                     }
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            MeshPill(state.meshPeerCount)
             Spacer(Modifier.height(12.dp))
 
             if (state.pendingCount > 0) {
@@ -177,6 +180,32 @@ fun ReceiveScreen(
                              fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MeshPill(peerCount: Int) {
+    val (label, sub) = when (peerCount) {
+        0 -> "Mesh: searching for peers…" to "ADVERTISING + DISCOVERING"
+        1 -> "Mesh: 1 peer connected" to "P2P RELAY ACTIVE"
+        else -> "Mesh: $peerCount peers connected" to "P2P RELAY ACTIVE"
+    }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (peerCount > 0) OffpayColors.TealSoft else OffpayColors.OffWhite)
+            .border(1.dp, OffpayColors.Hairline, RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Icon(Icons.Outlined.Hub, null, tint = OffpayColors.TealDeep, modifier = Modifier.size(16.dp))
+            Column {
+                Text(label, color = OffpayColors.Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                MonoLabel(sub)
             }
         }
     }

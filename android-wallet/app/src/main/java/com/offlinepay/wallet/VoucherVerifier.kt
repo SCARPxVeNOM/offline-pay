@@ -104,10 +104,12 @@ class VoucherVerifier(
         return Hash.sha3(Numeric.hexStringToByteArray(encoded))
     }
 
-    private fun ethSignedMessageHash(digest: ByteArray): ByteArray {
-        val prefix = "Ethereum Signed Message:\n${digest.size}".toByteArray(Charsets.UTF_8)
-        return Hash.sha3(prefix + digest)
-    }
+    /// Apply EIP-191 personal_sign prefix and hash. Use Web3j's canonical
+    /// helper rather than rolling our own — the prefix begins with the
+    /// 0x19 byte (""), which our previous hand-rolled string was
+    /// silently dropping. That made every signature verify fail.
+    private fun ethSignedMessageHash(digest: ByteArray): ByteArray =
+        Sign.getEthereumMessageHash(digest)
 
     private fun parseSignature(hex: String): Sign.SignatureData {
         val bytes = Numeric.hexStringToByteArray(hex)

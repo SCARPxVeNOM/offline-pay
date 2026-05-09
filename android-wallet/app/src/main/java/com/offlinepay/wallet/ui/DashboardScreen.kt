@@ -98,7 +98,7 @@ fun DashboardScreen(
             TapHero(onSend = onSend, onReceive = onReceive)
             if (state.settleStatus != null) SettleBanner(state.settleStatus, onSettleNow)
             if (state.pendingCount > 0) PendingBanner(state.pendingCount, state.pendingUsdc, onSettleNow)
-            if (state.meshPeerCount > 0) MeshStatusBanner(state.meshPeerCount)
+            MeshStatusBanner(state.meshPeerCount)
             SectionHeader("Quick actions", "View all ›")
             QuickActions(onTopup = onTopup, onBackup = onBackup, onHistory = onHistory)
             SectionHeader("Recent activity", "See all ›")
@@ -505,11 +505,16 @@ private fun MeshStatusBanner(peerCount: Int) {
         ) {
             Icon(Icons.Outlined.Hub, null, tint = OffpayColors.TealDeep, modifier = Modifier.size(16.dp))
             Column {
+                val title = when (peerCount) {
+                    0 -> "Mesh: searching for peers…"
+                    1 -> "Mesh: 1 peer connected"
+                    else -> "Mesh: $peerCount peers connected"
+                }
                 Text(
-                    "Mesh: $peerCount peer${if (peerCount == 1) "" else "s"} connected",
+                    title,
                     color = OffpayColors.Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                 )
-                MonoLabel("P2P BACKUP ACTIVE")
+                MonoLabel(if (peerCount > 0) "P2P BACKUP ACTIVE" else "ADVERTISING + DISCOVERING")
             }
         }
     }

@@ -310,8 +310,10 @@ app.post("/api/wallet/init", async (req, res) => {
         const t = await usdc.mint(address, amt);
         txList.push({ key: 'mint', tx: t });
       }
-      // Wait for all in parallel — both already broadcast.
-      await Promise.all(txList.map(it => it.tx.wait()));
+      // Wait for all in parallel — both already broadcast. 60s timeout so a
+      // tx that never mines (e.g. Amoy congestion) doesn't wedge the global
+      // chain-op queue and lock out every subsequent /init for everyone.
+      await Promise.all(txList.map(it => it.tx.wait(1, 60_000)));
       for (const it of txList) txs[it.key] = it.tx.hash;
       return txs;
     });

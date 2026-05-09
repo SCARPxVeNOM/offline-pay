@@ -22,6 +22,7 @@
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <application
+        android:name=".OffpayApp"
         android:label="OFFPAY"
         android:icon="@drawable/offpay_logo"
         android:roundIcon="@drawable/offpay_logo"
