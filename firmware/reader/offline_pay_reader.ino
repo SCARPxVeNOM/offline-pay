@@ -244,12 +244,27 @@ void loop() {
   Serial.println(String("[BT] decision=") + decision);
 
   if (decision == "ACCEPT") {
-    flashGreen();
-    if (markVoucherUsed()) {
+    // Mark the card USED *before* the visual cue. flashGreen takes
+    // ~1 second; during that wait the MFRC522's session state is lost
+    // (or the user lifts the card). Doing the write first ensures the
+    // card is reliably overwritten while we still have a live session.
+    bool marked = markVoucherUsed();
+    if (marked) {
       Serial.println("[CARD] marked USED");
     } else {
+      // Re-establish the session with the card and try once more.
+      // Common after a long wait — PICC drops state.
+      halt();
+      btSleep(40);
+      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+        marked = markVoucherUsed();
+        if (marked) Serial.println("[CARD] marked USED (retry)");
+      }
+    }
+    if (!marked) {
       Serial.println("[CARD] WARN: could not mark USED — risk of replay!");
     }
+    flashGreen();
   } else if (decision == "REJECT") {
     flashRed("REJECT");
   } else {

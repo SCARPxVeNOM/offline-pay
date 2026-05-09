@@ -10,6 +10,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.serialization.json.Json
+import org.web3j.crypto.Keys
+import org.web3j.crypto.Sign
+import org.web3j.utils.Numeric
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
@@ -97,9 +100,28 @@ class BluetoothBridge(
                     pendingVoucher = parseVoucherFrame(trimmed)
                 }
                 trimmed.startsWith("ENDORSE ") -> {
-                    val endorse = parseEndorseFrame(trimmed)
+                    val rawEndorse = parseEndorseFrame(trimmed)
                     val v = pendingVoucher
-                    if (endorse != null && v != null) {
+                    if (rawEndorse != null && v != null) {
+                        // Repair the firmware's hardcoded v=27 byte. The
+                        // contract's ECDSA.recover uses v as-is, so we
+                        // try both 27/28 and pick the one that actually
+                        // recovers to the device address. Without this,
+                        // ~50% of endorsed settles revert on chain.
+                        val digest = EndorsementDigest.digest(
+                            voucherId       = v.voucherId,
+                            device          = rawEndorse.deviceAddress,
+                            merchantPrimary = rawEndorse.merchantPrimary,
+                            endorsementTs   = rawEndorse.timestamp,
+                            chainId         = Config.CHAIN_ID,
+                            vaultAddress    = Config.VAULT_ADDRESS,
+                        )
+                        val fixedSig = EndorsementDigest.fixSigV(
+                            digest          = digest,
+                            sigHex          = rawEndorse.signature,
+                            expectedDevice  = rawEndorse.deviceAddress,
+                        )
+                        val endorse = rawEndorse.copy(signature = fixedSig)
                         Log.d(TAG, "voucher ${v.voucherId.take(10)} endorsed by ${endorse.deviceAddress.take(10)} → ${endorse.merchantPrimary.take(10)}")
                         _incoming.emit(IncomingVoucher(v, endorse))
                     } else {
