@@ -37,6 +37,21 @@ data class UnspentRow(
     val spentAtMs: Long?,
 )
 
+/// Unified activity feed shared between sender and receiver views. One
+/// entry per user-meaningful event (topup, sent voucher, received voucher,
+/// on-chain settle). Drives the dashboard "recent activity" list.
+@Entity(tableName = "activity")
+data class ActivityRow(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val kind: String,                // topup | sent | received | settled | failed
+    val amountBaseUnits: Long,
+    val counterparty: String?,        // peer address (sender or receiver) — nullable for topup
+    val voucherId: String?,
+    val txHash: String?,              // when on-chain
+    val ts: Long,
+    val note: String? = null,
+)
+
 @Dao
 interface VoucherDao {
     @Query("SELECT COUNT(*) > 0 FROM vouchers WHERE voucherId = :id")
@@ -56,6 +71,9 @@ interface VoucherDao {
 
     @Query("UPDATE vouchers SET status='settled', settledTx=:tx WHERE voucherId=:id")
     suspend fun markSettled(id: String, tx: String)
+
+    @Query("UPDATE vouchers SET status='rejected', rejectReason=:reason WHERE voucherId=:id")
+    suspend fun markRejected(id: String, reason: String)
 }
 
 @Dao
@@ -76,10 +94,26 @@ interface UnspentDao {
     suspend fun markSpent(ids: List<String>, ts: Long)
 }
 
-@Database(entities = [VoucherRow::class, UnspentRow::class], version = 2, exportSchema = false)
+@Dao
+interface ActivityDao {
+    @Insert
+    suspend fun insert(row: ActivityRow): Long
+
+    @Query("SELECT * FROM activity ORDER BY ts DESC LIMIT 200")
+    fun recent(): Flow<List<ActivityRow>>
+
+    @Query("UPDATE activity SET txHash=:tx WHERE id=:id")
+    suspend fun setTx(id: Long, tx: String)
+}
+
+@Database(
+    entities = [VoucherRow::class, UnspentRow::class, ActivityRow::class],
+    version = 3, exportSchema = false,
+)
 abstract class VoucherDb : RoomDatabase() {
     abstract fun voucherDao(): VoucherDao
     abstract fun unspentDao(): UnspentDao
+    abstract fun activityDao(): ActivityDao
     companion object {
         @Volatile private var INSTANCE: VoucherDb? = null
         fun get(ctx: Context): VoucherDb =
@@ -119,7 +153,63 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
 
     suspend fun pendingForSettle() = dao.pendingForSettle()
     suspend fun markSettled(id: String, tx: String) = dao.markSettled(id, tx)
+    suspend fun markRejected(id: String, reason: String) = dao.markRejected(id, reason)
     fun recent(): Flow<List<VoucherRow>> = dao.recent()
+}
+
+/// Unified activity feed store. Consumers call `record*` from any side
+/// (sender, receiver, topup) and the dashboard streams them.
+class ActivityStore(ctx: Context) {
+    private val dao = VoucherDb.get(ctx).activityDao()
+
+    fun recent(): Flow<List<ActivityRow>> = dao.recent()
+
+    suspend fun recordTopup(amountBaseUnits: Long, txHash: String?) {
+        dao.insert(ActivityRow(
+            kind = "topup", amountBaseUnits = amountBaseUnits,
+            counterparty = null, voucherId = null, txHash = txHash,
+            ts = System.currentTimeMillis(),
+            note = "Locked into vault",
+        ))
+    }
+
+    suspend fun recordReceived(voucherId: String, payer: String, amountBaseUnits: Long) {
+        dao.insert(ActivityRow(
+            kind = "received", amountBaseUnits = amountBaseUnits,
+            counterparty = payer, voucherId = voucherId, txHash = null,
+            ts = System.currentTimeMillis(),
+            note = "Tapped offline",
+        ))
+    }
+
+    suspend fun recordSent(voucherId: String, recipient: String, amountBaseUnits: Long) {
+        dao.insert(ActivityRow(
+            kind = "sent", amountBaseUnits = amountBaseUnits,
+            counterparty = recipient, voucherId = voucherId, txHash = null,
+            ts = System.currentTimeMillis(),
+            note = "Tapped offline",
+        ))
+    }
+
+    suspend fun recordSettled(voucherIds: List<String>, txHash: String) {
+        // One audit row per settle batch. The voucherIds are joined into note.
+        dao.insert(ActivityRow(
+            kind = "settled", amountBaseUnits = 0L,
+            counterparty = null,
+            voucherId = voucherIds.firstOrNull(),
+            txHash = txHash, ts = System.currentTimeMillis(),
+            note = "${voucherIds.size} voucher${if (voucherIds.size == 1) "" else "s"} settled on chain",
+        ))
+    }
+
+    suspend fun recordFailed(reason: String) {
+        dao.insert(ActivityRow(
+            kind = "failed", amountBaseUnits = 0L,
+            counterparty = null, voucherId = null, txHash = null,
+            ts = System.currentTimeMillis(),
+            note = reason,
+        ))
+    }
 }
 
 /// Sender-side store for pre-signed bearer vouchers issued by the backend

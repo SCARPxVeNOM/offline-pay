@@ -1,0 +1,9 @@
+{
+  "network": "amoy",
+  "chainId": 80002,
+  "usdc": "0x03Ad909F2b68328ED1606dDD894816978A0CE7a1",
+  "vault": "0x30b01f8e5Ed5E3b958f0009019fd3f3b9b5d6cE5",
+  "registry": "0x31C3860B91f63b98ddC5BF0C0FABab3fA1d27B98",
+  "deployer": "0x092661531D9186Fa6E48501A5e3b508B3F52e64c",
+  "deployedAt": "2026-05-08T22:05:05.119Z"
+}

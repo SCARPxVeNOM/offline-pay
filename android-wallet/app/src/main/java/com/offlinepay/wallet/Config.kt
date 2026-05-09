@@ -18,4 +18,9 @@ object Config {
 
     val MAX_SINGLE_USDC: BigInteger = BigInteger("2000000")  // $2.00, matches contract
     const val DEFAULT_TTL_SECONDS    = 24L * 3600
+
+    /// Block explorer base — used to render live links from receipts.
+    const val EXPLORER_BASE = "https://amoy.polygonscan.com"
+    fun txUrl(hash: String) = "$EXPLORER_BASE/tx/$hash"
+    fun addressUrl(addr: String) = "$EXPLORER_BASE/address/$addr"
 }

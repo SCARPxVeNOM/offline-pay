@@ -1,4 +1,93 @@
-# OfflinePay
+# OFFPAY
+
+> **Tap now. Chain later.** Two Android phones can transfer USDC peer-to-peer
+> with both phones fully offline, then the receiver settles to Polygon when
+> internet returns. No POS, no QR, no SMS — just NFC tap.
+
+## What's new (v2 — unified wallet app)
+
+The current shippable build is `android-wallet/`. Both phones run the same
+app and can act as either sender or receiver per transaction. End-to-end
+flow:
+
+1. **Topup** (online): user wallet locks USDC into `OfflineVault` on
+   Polygon Amoy. Backend gas-sponsors the wallet so a fresh user has zero
+   onboarding friction.
+2. **Tap** (offline): sender enters amount → arms HCE → taps receiver's
+   phone. Sender's HCE signs a bearer voucher at tap time using the user's
+   own secp256k1 key + `NonceTracker`; the receiver's NFC reader verifies
+   the signature locally.
+3. **Settle** (online, opportunistic): receiver's phone calls
+   `OfflineVault.settleBearerBatch(vouchers, sigs, recipient)` directly
+   from its own wallet → vault transfers USDC to receiver. A
+   `NetworkCallback` fires this automatically on connectivity restore.
+
+Every settle tx is visible on Polygonscan. Both sender's `lockFunds` and
+receiver's `settleBearerBatch` show up under their respective wallet
+addresses.
+
+### What this build proves
+
+- ✅ Phone-to-phone NFC tap works end-to-end on real Android hardware
+  (tested OnePlus 6T ↔ Samsung).
+- ✅ Both users hold their own keys and sign their own on-chain
+  transactions — no custodial reliance during tap or settle.
+- ✅ Sender phone never opens an Ethereum RPC; only the receiver does
+  (and a backend-relay fallback if it lacks gas).
+- ✅ `OfflinePay` voucher digest is byte-identical across Solidity,
+  voucher.js, `VoucherSigner.kt`, and `VoucherVerifier.kt`.
+
+### Quick start (two phones)
+
+```powershell
+# 0) Deploy contracts to Polygon Amoy (one-time)
+cd contracts && npm install
+$env:DEPLOYER_PRIVATE_KEY = "0x…"
+npx hardhat run --network amoy scripts/deploy.js
+# Paste vault + usdc addresses into android-wallet/.../Config.kt
+
+# 1) Backend on laptop
+cd ..\backend && npm install && npm start
+
+# 2) Two phones via USB, ADB
+adb -s <oneplus> reverse tcp:4000 tcp:4000
+adb -s <samsung> reverse tcp:4000 tcp:4000
+
+# 3) Build + install the wallet APK
+cd ..\android-wallet
+.\gradlew.bat :app:assembleDebug
+adb -s <oneplus> install -r app\build\outputs\apk\debug\app-debug.apk
+adb -s <samsung> install -r app\build\outputs\apk\debug\app-debug.apk
+
+# 4) E2E protocol test (no UI required)
+cd ..\backend && node src/e2e_test.js
+```
+
+### v2 architecture (Option B — non-custodial)
+
+```
+[Sender phone]              [Receiver phone]            [Backend]              [Polygon Amoy]
+─ KeyVault                  ─ KeyVault                  ─ /api/wallet/init     ─ OfflineVault
+─ NonceTracker              ─ VoucherStore               (gas + USDC mint)      (lockFunds,
+─ VoucherSigner             ─ VoucherVerifier           ─ /api/wallet/redeem    settleBearerBatch)
+─ HCE service               ─ ReaderModeLoop             (gas-sponsor relay)   ─ MockUSDC (Amoy)
+─ SettlementClient          ─ SettlementClient
+  · approveAndLock            · settleBearerBatch
+```
+
+### Known limitations / pre-pilot work
+
+- MockUSDC on Amoy. Real-money flow needs an on-ramp like
+  [Onmeta](https://onmeta.in) — see
+  [docs/superpowers/specs/](docs/superpowers/specs/).
+- KeyVault stores private keys in `SharedPreferences` plaintext. Move to
+  Android Keystore before any pilot money moves.
+- Backend keeps a small custodial gas sponsor; for production this would
+  graduate to ERC-2771 meta-tx relayer.
+
+---
+
+## v1 (legacy) — customer/merchant split
 
 > Cryptographically-signed offline payments for India. **Both** the customer **and**
 > the merchant can be fully offline. Settlement happens on Polygon when either side

@@ -9,4 +9,13 @@
         <item name="android:windowLightNavigationBar">true</item>
         <item name="android:windowBackground">@android:color/white</item>
     </style>
+
+    <!-- Splash uses a dark backdrop so the glow logo blends naturally. -->
+    <style name="Theme.Offpay.Splash" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#FF14171B</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">#FF14171B</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">#FF14171B</item>
+    </style>
 </resources>

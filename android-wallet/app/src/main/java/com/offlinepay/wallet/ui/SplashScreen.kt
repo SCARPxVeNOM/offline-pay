@@ -66,25 +66,27 @@ fun SplashScreen(durationMs: Long = 3500, onDone: () -> Unit) {
         Modifier
             .fillMaxSize()
             .background(
+                // Dark vignette matching the glow logo's own backdrop —
+                // gives the impression the logo is the only light source.
                 Brush.radialGradient(
-                    colors = listOf(Color(0xFFFAFDFC), Color(0xFFE8EFEE), Color(0xFFD6DFDE)),
-                    radius = 1200f,
+                    colors = listOf(Color(0xFF505358), Color(0xFF2A2D32), Color(0xFF14171B)),
+                    radius = 1300f,
                 )
             )
     ) {
-        // bottom-left teal wash
+        // soft cyan wash from the logo radiating outward
         Box(
             Modifier
                 .fillMaxSize()
                 .background(
                     Brush.radialGradient(
                         colors = listOf(
-                            OffpayColors.Teal.copy(alpha = 0.35f),
-                            OffpayColors.Teal.copy(alpha = 0.10f),
+                            Color(0x664FC2FF),
+                            Color(0x224FC2FF),
                             Color.Transparent,
                         ),
-                        center = androidx.compose.ui.geometry.Offset(0f, Float.POSITIVE_INFINITY),
-                        radius = 900f,
+                        center = androidx.compose.ui.geometry.Offset(540f, 720f),
+                        radius = 700f,
                     )
                 )
         )
@@ -97,30 +99,34 @@ fun SplashScreen(durationMs: Long = 3500, onDone: () -> Unit) {
                 .padding(horizontal = 24.dp, vertical = 24.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            MonoLabel("OFFPAY · v1.0", color = OffpayColors.Ink.copy(alpha = 0.55f))
-            MonoLabel("SECURE BOOT", color = OffpayColors.Ink.copy(alpha = 0.55f))
+            MonoLabel("OFFPAY · v1.0", color = Color.White.copy(alpha = 0.55f))
+            MonoLabel("SECURE BOOT", color = Color.White.copy(alpha = 0.55f))
         }
 
-        // Center stage: ripples + logo
+        // Center stage: just the glowing logo (it carries its own halo).
         Box(
             Modifier
                 .align(Alignment.Center)
                 .padding(bottom = 80.dp)
-                .size(320.dp),
+                .size(360.dp),
             contentAlignment = Alignment.Center,
         ) {
-            // 3 ripples staggered
+            // Subtle ripples in cyan to amplify the NFC theme.
             listOf(0f, 0.3f, 0.6f).forEach { delayFraction ->
                 Box(
                     Modifier
-                        .size(220.dp)
+                        .size(280.dp)
                         .scale(rippleScale + delayFraction)
                         .alpha((rippleAlpha - delayFraction * 0.2f).coerceAtLeast(0f))
                         .clip(CircleShape)
                         .background(
                             Brush.radialGradient(
-                                colors = listOf(Color.Transparent, OffpayColors.Teal.copy(alpha = 0.15f), Color.Transparent),
-                                radius = 200f,
+                                colors = listOf(
+                                    Color.Transparent,
+                                    Color(0x224FC2FF),
+                                    Color.Transparent,
+                                ),
+                                radius = 280f,
                             )
                         )
                 )
@@ -130,13 +136,13 @@ fun SplashScreen(durationMs: Long = 3500, onDone: () -> Unit) {
                 painter = painterResource(id = R.drawable.offpay_logo),
                 contentDescription = "OFFPAY",
                 modifier = Modifier
-                    .size(180.dp)
+                    .size(320.dp)
                     .scale(logoScale)
                     .alpha(logoAlpha),
             )
         }
 
-        // Wordmark + slogan
+        // Wordmark + slogan (white now, against the dark splash).
         Column(
             Modifier
                 .align(Alignment.BottomCenter)
@@ -147,7 +153,7 @@ fun SplashScreen(durationMs: Long = 3500, onDone: () -> Unit) {
         ) {
             Text(
                 "OFFPAY",
-                color = OffpayColors.Ink,
+                color = Color.White,
                 fontSize = 44.sp,
                 fontWeight = FontWeight.Black,
                 fontFamily = DisplayFamily,
@@ -158,13 +164,13 @@ fun SplashScreen(durationMs: Long = 3500, onDone: () -> Unit) {
                 Modifier
                     .width(56.dp)
                     .height(2.dp)
-                    .background(OffpayColors.Teal)
+                    .background(Color(0xFF4FC2FF))
             )
             Spacer(Modifier.height(12.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                MonoLabel("TAP NOW", color = OffpayColors.Ink, fontSize = 11.sp, letterSpacing = 2.4.sp)
-                Box(Modifier.padding(horizontal = 8.dp).size(5.dp).clip(CircleShape).background(OffpayColors.Teal))
-                MonoLabel("CHAIN LATER", color = OffpayColors.Ink, fontSize = 11.sp, letterSpacing = 2.4.sp)
+                MonoLabel("TAP NOW", color = Color.White, fontSize = 11.sp, letterSpacing = 2.4.sp)
+                Box(Modifier.padding(horizontal = 8.dp).size(5.dp).clip(CircleShape).background(Color(0xFF4FC2FF)))
+                MonoLabel("CHAIN LATER", color = Color.White, fontSize = 11.sp, letterSpacing = 2.4.sp)
             }
         }
 
@@ -190,21 +196,21 @@ fun SplashScreen(durationMs: Long = 3500, onDone: () -> Unit) {
                     .fillMaxWidth()
                     .height(2.dp)
                     .clip(androidx.compose.foundation.shape.RoundedCornerShape(2.dp))
-                    .background(OffpayColors.Hairline)
+                    .background(Color.White.copy(alpha = 0.10f))
             ) {
                 Box(
                     Modifier
                         .fillMaxWidth(progress)
                         .height(2.dp)
-                        .background(OffpayColors.Ink)
+                        .background(Color(0xFF4FC2FF))
                 )
             }
             Spacer(Modifier.height(14.dp))
             Row(verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth()) {
-                MonoLabel("INITIALISING WALLET", color = OffpayColors.Ink.copy(alpha = 0.55f), fontSize = 10.sp, letterSpacing = 1.2.sp)
-                MonoLabel("· · ·", color = OffpayColors.Ink.copy(alpha = 0.55f))
+                MonoLabel("INITIALISING WALLET", color = Color.White.copy(alpha = 0.55f), fontSize = 10.sp, letterSpacing = 1.2.sp)
+                MonoLabel("· · ·", color = Color.White.copy(alpha = 0.55f))
             }
         }
     }

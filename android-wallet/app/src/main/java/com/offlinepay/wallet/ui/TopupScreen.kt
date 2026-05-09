@@ -61,9 +61,8 @@ fun TopupScreen(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp)
         ) {
-            FlowRow("1", "Backend funds gas + mints USDC", busy && statusKind == StatusKind.Working)
-            FlowRow("2", "Wallet signs approve", busy && statusKind == StatusKind.Working)
-            FlowRow("3", "Wallet signs lockFunds", busy && statusKind == StatusKind.Working)
+            FlowRow("1", "Backend funds gas + mints USDC (parallel)", busy && statusKind == StatusKind.Working)
+            FlowRow("2", "Wallet signs approve + lock (consecutive)", busy && statusKind == StatusKind.Working)
         }
 
         Spacer(Modifier.height(20.dp))

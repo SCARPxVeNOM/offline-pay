@@ -43,6 +43,8 @@ data class RecentRow(
     val sub: String,
     val amountSigned: String,
     val incoming: Boolean,
+    /// If non-null, the row is clickable and opens the Polygon explorer.
+    val explorerUrl: String? = null,
 )
 
 @Composable
@@ -54,6 +56,7 @@ fun DashboardScreen(
     onHistory: () -> Unit,
     onBackup: () -> Unit,
     onSettleNow: () -> Unit,
+    onAddressClick: () -> Unit = {},
 ) {
     Box(
         Modifier
@@ -80,7 +83,7 @@ fun DashboardScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(top = 8.dp, bottom = 28.dp)
         ) {
-            DashHeader(walletShort = state.walletAddress.short())
+            DashHeader(walletShort = state.walletAddress.short(), onClick = onAddressClick)
             ConnectWalletPill(walletAddress = state.walletAddress, onClick = onBackup)
             BalanceCard(
                 lockedUsdc = state.lockedUsdc,
@@ -100,7 +103,7 @@ fun DashboardScreen(
 }
 
 @Composable
-private fun DashHeader(walletShort: String) {
+private fun DashHeader(walletShort: String, onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -108,7 +111,11 @@ private fun DashHeader(walletShort: String) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.clickable { onClick() },
+        ) {
             // Avatar with the OFFPAY hand-coin logo, small.
             Box(
                 Modifier
@@ -547,10 +554,20 @@ private fun RecentActivity(rows: List<RecentRow>) {
 
 @Composable
 private fun ActivityRow(r: RecentRow) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val rowMod = Modifier
+        .fillMaxWidth()
+        .let { base ->
+            if (r.explorerUrl != null) base.clickable {
+                ctx.startActivity(
+                    android.content.Intent(android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse(r.explorerUrl))
+                )
+            } else base
+        }
+        .padding(horizontal = 14.dp, vertical = 12.dp)
     Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+        rowMod,
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -573,8 +590,20 @@ private fun ActivityRow(r: RecentRow) {
             Spacer(Modifier.height(2.dp))
             MonoLabel(r.sub, fontSize = 9.5.sp)
         }
-        Text(r.amountSigned, color = if (r.incoming) OffpayColors.TealDeep else OffpayColors.Ink,
-             fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        Column(horizontalAlignment = Alignment.End) {
+            Text(r.amountSigned, color = if (r.incoming) OffpayColors.TealDeep else OffpayColors.Ink,
+                 fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            if (r.explorerUrl != null) {
+                Spacer(Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    MonoLabel("EXPLORER", fontSize = 8.sp, letterSpacing = 1.4.sp,
+                              color = OffpayColors.TealDeep)
+                    Icon(Icons.Outlined.OpenInNew, null, tint = OffpayColors.TealDeep,
+                         modifier = Modifier.size(10.dp))
+                }
+            }
+        }
     }
 }
 

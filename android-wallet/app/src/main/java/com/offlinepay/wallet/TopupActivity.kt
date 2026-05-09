@@ -24,6 +24,7 @@ class TopupActivity : ComponentActivity() {
         super.onCreate(s)
         val keyVault = KeyVault(this)
         val backend  = BackendClient(Config.BACKEND_BASE)
+        val activity = ActivityStore(this)
         val settle   = SettlementClient(
             rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
             chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
@@ -55,17 +56,16 @@ class TopupActivity : ComponentActivity() {
                         statusKind.value = StatusKind.Working
                         lifecycleScope.launch {
                             runCatching {
-                                status.value = "(1/3) backend funding gas + minting…"
+                                status.value = "(1/2) funding gas + minting USDC…"
                                 val initResp = backend.init(keyVault.address, baseUnits)
                                 if (!initResp.ok) error(initResp.error ?: "init failed")
-                                status.value = "(2/3) signing approve…"
-                                settle.approveUsdc(Config.USDC_ADDRESS, Config.VAULT_ADDRESS, amtBI)
-                                status.value = "(3/3) signing lockFunds…"
-                                val lockTx = settle.lockFunds(amtBI)
+                                status.value = "(2/2) signing approve + lock…"
+                                val lockTx = settle.approveAndLock(Config.USDC_ADDRESS, amtBI)
+                                activity.recordTopup(baseUnits, lockTx)
                                 status.value = "✓ locked ${amount.value} USDC — tx ${lockTx.take(10)}…"
                                 statusKind.value = StatusKind.Success
                             }.onFailure {
-                                status.value = it.message ?: "topup failed"
+                                status.value = Errors.friendly(it)
                                 statusKind.value = StatusKind.Error
                             }
                             busy.value = false

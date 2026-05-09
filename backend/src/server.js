@@ -282,21 +282,26 @@ app.post("/api/wallet/init", async (req, res) => {
 
     const result = await withChainLock(async () => {
       const txs = {};
-      // Amoy gas can spike; one settleBearerBatch costs ~0.06 MATIC, and a
-      // topup runs three txs (~0.18). Keep a high floor + generous top-up so
-      // a single mid-flow gas spike doesn't cause "insufficient funds".
       const gasFloor = ethers.parseEther("0.10");
       const gasTopup = ethers.parseEther("0.20");
       const balance  = await provider.getBalance(address);
+      // Submit sequentially — Promise.all races nonces in NonceManager and
+      // Infura intermittently rejects with "nonce too low" when the second
+      // tx beats the first into the mempool. Submit fire-and-forget then
+      // Promise.all the wait()s for parallel mining.
+      const txList = [];
       if (balance < gasFloor) {
         const need = gasTopup - balance;
         const t = await signer.sendTransaction({ to: address, value: need });
-        txs.gas = (await t.wait()).hash;
+        txList.push({ key: 'gas', tx: t });
       }
       if (amt > 0n) {
-        const t2 = await usdc.mint(address, amt);
-        txs.mint = (await t2.wait()).hash;
+        const t = await usdc.mint(address, amt);
+        txList.push({ key: 'mint', tx: t });
       }
+      // Wait for all in parallel — both already broadcast.
+      await Promise.all(txList.map(it => it.tx.wait()));
+      for (const it of txList) txs[it.key] = it.tx.hash;
       return txs;
     });
 

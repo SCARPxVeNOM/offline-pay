@@ -11,7 +11,7 @@ import org.web3j.crypto.Sign
 import org.web3j.utils.Numeric
 import java.math.BigInteger
 
-enum class VerifyResult { VALID, EXPIRED, EXCEEDS_LIMIT, BAD_SIGNATURE, ALREADY_SEEN, WRONG_RECIPIENT }
+enum class VerifyResult { VALID, EXPIRED, EXCEEDS_LIMIT, BAD_SIGNATURE, ALREADY_SEEN, WRONG_RECIPIENT, NOT_BEARER }
 
 /// Reproduces OfflineVault.voucherDigest exactly. Then EIP-191 prefix is
 /// applied and Sign.signedMessageHashToKey recovers the public key, which
@@ -28,9 +28,11 @@ class VoucherVerifier(
         if (System.currentTimeMillis() / 1000 > v.expiry)         return VerifyResult.EXPIRED
         if (v.amount > maxSinglePayment)                          return VerifyResult.EXCEEDS_LIMIT
         if (voucherStore.exists(v.voucherId))                     return VerifyResult.ALREADY_SEEN
-        if (!v.merchant.equals(expectedRecipient, ignoreCase = true) &&
-            v.merchant != "0x0000000000000000000000000000000000000000")
-            return VerifyResult.WRONG_RECIPIENT
+        // Bearer-only flow: any voucher with a non-zero merchant slot is
+        // unsettleable via settleBearerBatch and must be rejected at
+        // receive time so it never enters the auto-settle loop.
+        if (v.merchant != "0x0000000000000000000000000000000000000000")
+            return VerifyResult.NOT_BEARER
 
         return try {
             val digest = voucherDigest(v)

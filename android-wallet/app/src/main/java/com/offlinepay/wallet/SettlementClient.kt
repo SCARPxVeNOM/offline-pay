@@ -33,7 +33,12 @@ class SettlementClient(
         require(rows.isNotEmpty()) { "no vouchers to settle" }
 
         val voucherTuples = rows.map { r ->
-            DynamicStruct(
+            // Web3j's DynamicStruct adds an extra offset header that the contract's
+            // static-struct ABI doesn't expect — it would shift every field by one
+            // word and the merchant slot would resolve to a non-zero address,
+            // tripping the bearer check. StaticStruct is the right encoder here
+            // because every Voucher field is a static type.
+            StaticStruct(
                 Address(r.payer),
                 Address(r.merchant),
                 Uint256(BigInteger(r.amount)),
@@ -50,7 +55,7 @@ class SettlementClient(
             "settleBatch",
             listOf(
                 @Suppress("UNCHECKED_CAST")
-                DynamicArray(DynamicStruct::class.java, voucherTuples) as Type<*>,
+                DynamicArray(StaticStruct::class.java, voucherTuples) as Type<*>,
                 DynamicArray(DynamicBytes::class.java, sigs) as Type<*>
             ),
             emptyList()
@@ -58,7 +63,7 @@ class SettlementClient(
         val data = FunctionEncoder.encode(function)
 
         val nonce = web3.ethGetTransactionCount(
-            fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING
+            fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.LATEST
         ).send().transactionCount
 
         val gasPrice = web3.ethGasPrice().send().gasPrice
@@ -81,8 +86,13 @@ class SettlementClient(
         withContext(Dispatchers.IO) {
             require(rows.isNotEmpty()) { "no vouchers to settle" }
 
+            // StaticStruct (not DynamicStruct) — Voucher's fields are all static
+            // types, so the contract ABI expects an inline tuple without the
+            // offset header that DynamicStruct adds. DynamicStruct shifts every
+            // field by one word: merchant ends up reading the payer address,
+            // failing `merchant == 0` and reverting "not bearer".
             val voucherTuples = rows.map { r ->
-                DynamicStruct(
+                StaticStruct(
                     Address(r.payer),
                     Address(r.merchant),
                     Uint256(BigInteger(r.amount)),
@@ -97,7 +107,7 @@ class SettlementClient(
                 "settleBearerBatch",
                 listOf(
                     @Suppress("UNCHECKED_CAST")
-                    DynamicArray(DynamicStruct::class.java, voucherTuples) as Type<*>,
+                    DynamicArray(StaticStruct::class.java, voucherTuples) as Type<*>,
                     DynamicArray(DynamicBytes::class.java, sigs) as Type<*>,
                     Address(recipient) as Type<*>
                 ),
@@ -105,7 +115,7 @@ class SettlementClient(
             )
             val data = FunctionEncoder.encode(function)
             val nonce = web3.ethGetTransactionCount(
-                fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING
+                fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.LATEST
             ).send().transactionCount
             val gasPrice = web3.ethGasPrice().send().gasPrice
             val gasLimit = BigInteger.valueOf(500_000L * rows.size + 200_000L)
@@ -117,12 +127,33 @@ class SettlementClient(
             )
             val resp = web3.ethSendRawTransaction(Numeric.toHexString(signed)).send()
             if (resp.hasError()) error("submit failed: ${resp.error.message}")
-            resp.transactionHash
+            val txHash = resp.transactionHash
+            // Poll for receipt up to 60s; reject if status != 1 (reverted on chain).
+            val rcpt = waitForReceipt(txHash) ?: error("settle tx not mined within 60s: $txHash")
+            if (rcpt.status != "0x1") error("settle reverted on chain: $txHash")
+            txHash
+        }
+
+    /// Poll Web3j for the receipt of [txHash]. Returns null if not mined
+    /// within ~60s.
+    private suspend fun waitForReceipt(txHash: String): org.web3j.protocol.core.methods.response.TransactionReceipt? =
+        withContext(Dispatchers.IO) {
+            repeat(30) {
+                val r = web3.ethGetTransactionReceipt(txHash).send().transactionReceipt
+                if (r.isPresent) return@withContext r.get()
+                kotlinx.coroutines.delay(2000)
+            }
+            null
         }
 
     suspend fun maticBalance(addr: String): BigInteger = withContext(Dispatchers.IO) {
         web3.ethGetBalance(addr, org.web3j.protocol.core.DefaultBlockParameterName.LATEST).send().balance
     }
+
+    /// Pre-flight: locked-balance lookup. Returns the payer's vault locked
+    /// USDC. Used to weed out dead vouchers before paying gas.
+    private suspend fun lockedBalanceFor(payer: String): BigInteger =
+        lockedBalance(payer)
 
     suspend fun lockedBalance(addr: String): BigInteger = withContext(Dispatchers.IO) {
         val function = Function(
@@ -148,6 +179,45 @@ class SettlementClient(
                 emptyList())
         }
 
+    /// Submit approve + lockFunds back-to-back with explicit consecutive
+    /// nonces. Halves the topup wall time vs querying the chain twice and
+    /// waiting for the first to mine. Returns the lockFunds tx hash.
+    suspend fun approveAndLock(usdcAddr: String, amount: BigInteger): String =
+        withContext(Dispatchers.IO) {
+            val baseNonce = web3.ethGetTransactionCount(
+                fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING
+            ).send().transactionCount
+            val gasPrice = web3.ethGasPrice().send().gasPrice
+            val creds    = org.web3j.crypto.Credentials.create(keyPair)
+
+            val approveData = FunctionEncoder.encode(Function(
+                "approve",
+                listOf(Address(vaultAddress), Uint256(amount)),
+                emptyList(),
+            ))
+            val approveTx = RawTransaction.createTransaction(
+                baseNonce, gasPrice, BigInteger.valueOf(120_000L),
+                usdcAddr, BigInteger.ZERO, approveData,
+            )
+            val approveSigned = TransactionEncoder.signMessage(approveTx, chainId, creds)
+            val approveResp = web3.ethSendRawTransaction(Numeric.toHexString(approveSigned)).send()
+            if (approveResp.hasError()) error("approve: ${approveResp.error.message}")
+
+            val lockData = FunctionEncoder.encode(Function(
+                "lockFunds",
+                listOf(Uint256(amount)),
+                emptyList(),
+            ))
+            val lockTx = RawTransaction.createTransaction(
+                baseNonce + BigInteger.ONE, gasPrice, BigInteger.valueOf(180_000L),
+                vaultAddress, BigInteger.ZERO, lockData,
+            )
+            val lockSigned = TransactionEncoder.signMessage(lockTx, chainId, creds)
+            val lockResp = web3.ethSendRawTransaction(Numeric.toHexString(lockSigned)).send()
+            if (lockResp.hasError()) error("lock: ${lockResp.error.message}")
+            lockResp.transactionHash
+        }
+
     suspend fun lockFunds(amount: BigInteger): String =
         sendWrite(vaultAddress) {
             Function("lockFunds",
@@ -158,7 +228,7 @@ class SettlementClient(
     private suspend fun sendWrite(to: String, fn: () -> Web3Function): String = withContext(Dispatchers.IO) {
         val data = FunctionEncoder.encode(fn())
         val nonce = web3.ethGetTransactionCount(
-            fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.PENDING
+            fromAddress, org.web3j.protocol.core.DefaultBlockParameterName.LATEST
         ).send().transactionCount
         val gasPrice = web3.ethGasPrice().send().gasPrice
         val gasLimit = BigInteger.valueOf(200_000L)

@@ -33,6 +33,7 @@ class HomeActivity : ComponentActivity() {
     private lateinit var keyVault: KeyVault
     private lateinit var received: VoucherStore
     private lateinit var backend: BackendClient
+    private lateinit var activity: ActivityStore
     private lateinit var settle: SettlementClient
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -43,6 +44,7 @@ class HomeActivity : ComponentActivity() {
         keyVault = KeyVault(this)
         received = VoucherStore(this)
         backend  = BackendClient(Config.BACKEND_BASE)
+        activity = ActivityStore(this)
         settle   = SettlementClient(
             rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
             chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
@@ -62,28 +64,29 @@ class HomeActivity : ComponentActivity() {
                     onHistory  = { startActivity(Intent(this, HistoryActivity::class.java)) },
                     onBackup   = { startActivity(Intent(this, BackupRestoreActivity::class.java)) },
                     onSettleNow= { homeScope.launch { autoSettle() } },
+                    onAddressClick = {
+                        startActivity(Intent(Intent.ACTION_VIEW,
+                            android.net.Uri.parse(Config.addressUrl(keyVault.address))))
+                    },
                 )
             }
         }
 
-        // Live recent activity from local store.
+        // Live unified activity feed: topup + sent + received + settled.
+        lifecycleScope.launch {
+            activity.recent().collect { rows ->
+                state.value = state.value.copy(recent = rows.take(20).map { it.toRecentRow() })
+            }
+        }
+        // Pending-receive count comes from the voucher store separately.
         lifecycleScope.launch {
             received.recent().collect { rows ->
-                val mapped = rows.take(5).map { r ->
-                    val amt = "%.2f".format(BigInteger(r.amount).toDouble() / 1e6)
-                    when (r.status) {
-                        "settled"  -> RecentRow("On-chain settle", "INCOMING · ${r.voucherId.take(10)}…", "+ \$$amt", true)
-                        "accepted" -> RecentRow("Voucher received", "PENDING SETTLE · NFC", "+ \$$amt", true)
-                        else       -> RecentRow("Rejected voucher", "ERROR · ${r.rejectReason ?: ""}", "  \$$amt", false)
-                    }
-                }
                 val pendingCount = rows.count { it.status == "accepted" }
                 val pendingTotal = "%.2f".format(
                     rows.filter { it.status == "accepted" }
                         .sumOf { BigInteger(it.amount) }.toDouble() / 1e6
                 )
                 state.value = state.value.copy(
-                    recent = mapped,
                     pendingCount = pendingCount,
                     pendingUsdc = pendingTotal,
                 )
@@ -114,34 +117,81 @@ class HomeActivity : ComponentActivity() {
     }
 
     private suspend fun autoSettle() {
-        val pending = received.pendingForSettle()
+        SettleGate.runIfFree { autoSettleInner() }
+    }
+
+    private suspend fun autoSettleInner() {
+        val all = received.pendingForSettle()
+        val ZERO = "0x0000000000000000000000000000000000000000"
+        // Quarantine non-bearer leftovers — they can't go through bearer settle.
+        all.filter { it.merchant != ZERO }.forEach {
+            received.markRejected(it.voucherId, "NOT_BEARER")
+            activity.recordFailed("Non-bearer voucher rejected")
+        }
+        var pending = all.filter { it.merchant == ZERO }
         if (pending.isEmpty()) return
-        state.value = state.value.copy(settleStatus = "settling ${pending.size} voucher(s)…")
+
+        // Pre-flight: drop any voucher whose payer has insufficient locked funds.
+        // This avoids broadcasting a tx that's guaranteed to revert.
+        val deadIds = mutableListOf<String>()
+        val live = mutableListOf<VoucherRow>()
+        for (v in pending) {
+            val locked = runCatching { settle.lockedBalance(v.payer) }.getOrNull()
+            if (locked != null && locked < BigInteger(v.amount)) {
+                received.markRejected(v.voucherId, "INSUFFICIENT_LOCKED")
+                activity.recordFailed("Sender has no locked funds — voucher dropped")
+                deadIds += v.voucherId
+            } else {
+                live += v
+            }
+        }
+        pending = live
+        if (deadIds.isNotEmpty()) {
+            state.value = state.value.copy(
+                settleStatus = "skipped ${deadIds.size} unbacked voucher(s)"
+            )
+        }
+        if (pending.isEmpty()) return
+        state.value = state.value.copy(settleStatus = "settling ${pending.size} on chain…")
+
         try {
             runCatching { backend.init(keyVault.address, 0L) }
             val tx = try {
                 settle.settleBearerBatch(pending, keyVault.address)
             } catch (t: Throwable) {
-                Log.w(TAG, "direct settle failed, fallback relay: ${t.message}")
-                val items = pending.map {
-                    BackendClient.RedeemItem(
-                        voucher = BackendClient.VoucherFields(
-                            payer = it.payer, merchant = it.merchant,
-                            amount = it.amount, expiry = it.expiry,
-                            nonce = it.nonce, voucherId = it.voucherId
-                        ),
-                        signature = it.signature
-                    )
-                }
-                val resp = backend.redeem(keyVault.address, items)
-                if (!resp.ok) error(resp.error ?: "relay failed")
-                resp.tx ?: error("relay returned no tx")
+                Log.w(TAG, "direct settle failed: ${t.message}")
+                // Try backend relay only if the failure is gas-related; on-chain
+                // reverts (insufficient locked, expired) will hit the same wall.
+                val isGasIssue = t.message?.contains("insufficient funds") == true ||
+                                 t.message?.contains("nonce") == true
+                if (isGasIssue) {
+                    val items = pending.map {
+                        BackendClient.RedeemItem(
+                            voucher = BackendClient.VoucherFields(
+                                payer = it.payer, merchant = it.merchant,
+                                amount = it.amount, expiry = it.expiry,
+                                nonce = it.nonce, voucherId = it.voucherId
+                            ),
+                            signature = it.signature
+                        )
+                    }
+                    val resp = backend.redeem(keyVault.address, items)
+                    if (!resp.ok) error(resp.error ?: "relay failed")
+                    resp.tx ?: error("relay returned no tx")
+                } else throw t
             }
             pending.forEach { received.markSettled(it.voucherId, tx) }
+            activity.recordSettled(pending.map { it.voucherId }, tx)
             state.value = state.value.copy(settleStatus = "⛓ settled ${pending.size} — tx ${tx.take(10)}…")
         } catch (t: Throwable) {
             Log.e(TAG, "settle failed", t)
-            state.value = state.value.copy(settleStatus = "settle failed: ${t.message}")
+            // Mark the offending voucher rejected so we don't keep retrying.
+            val tag = Errors.rejectTag(t)
+            if (tag != "UNKNOWN" && tag != "ERROR") {
+                pending.forEach { received.markRejected(it.voucherId, tag) }
+            }
+            activity.recordFailed(Errors.friendly(t))
+            state.value = state.value.copy(settleStatus = Errors.friendly(t))
         }
     }
 
@@ -177,4 +227,59 @@ class HomeActivity : ComponentActivity() {
     }
 
     companion object { private const val TAG = "OfflinePay/Home" }
+}
+
+private fun ActivityRow.toRecentRow(): RecentRow {
+    val amt = "%.2f".format(amountBaseUnits.toDouble() / 1e6)
+    val ts = relativeTs(ts)
+    val explorer = txHash?.let { Config.txUrl(it) }
+    val short = counterparty?.let { it.take(6) + "…" + it.takeLast(4) }
+    return when (kind) {
+        "topup"    -> RecentRow(
+            title = "Top-up locked",
+            sub = "ON-CHAIN · $ts",
+            amountSigned = "+ \$$amt",
+            incoming = true,
+            explorerUrl = explorer,
+        )
+        "sent"     -> RecentRow(
+            title = "Sent to ${short ?: "—"}",
+            sub = "TAPPED · $ts",
+            amountSigned = "− \$$amt",
+            incoming = false,
+            explorerUrl = null,  // sender doesn't broadcast; receiver does.
+        )
+        "received" -> RecentRow(
+            title = "Received from ${short ?: "—"}",
+            sub = "TAPPED · $ts",
+            amountSigned = "+ \$$amt",
+            incoming = true,
+            explorerUrl = null,
+        )
+        "settled"  -> RecentRow(
+            title = note ?: "Settled on chain",
+            sub = "TX ${txHash?.take(10) ?: ""}… · $ts",
+            amountSigned = "⛓",
+            incoming = true,
+            explorerUrl = explorer,
+        )
+        else       -> RecentRow(
+            title = note ?: kind,
+            sub = ts.uppercase(),
+            amountSigned = "",
+            incoming = false,
+        )
+    }
+}
+
+private fun relativeTs(ms: Long): String {
+    val now = System.currentTimeMillis()
+    val diffSec = ((now - ms) / 1000).coerceAtLeast(0)
+    return when {
+        diffSec < 60     -> "JUST NOW"
+        diffSec < 3600   -> "${diffSec / 60} MIN AGO"
+        diffSec < 86400  -> "${diffSec / 3600} H AGO"
+        diffSec < 604800 -> "${diffSec / 86400} D AGO"
+        else             -> "EARLIER"
+    }
 }

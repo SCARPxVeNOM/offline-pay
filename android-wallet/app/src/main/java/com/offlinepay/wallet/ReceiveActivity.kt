@@ -35,6 +35,7 @@ class ReceiveActivity : ComponentActivity() {
     private lateinit var store: VoucherStore
     private lateinit var verifier: VoucherVerifier
     private lateinit var backend: BackendClient
+    private lateinit var activity: ActivityStore
     private lateinit var settle: SettlementClient
     private lateinit var reader: ReaderModeLoop
     private var netCallback: ConnectivityManager.NetworkCallback? = null
@@ -66,8 +67,9 @@ class ReceiveActivity : ComponentActivity() {
             Config.CHAIN_ID, Config.VAULT_ADDRESS, Config.MAX_SINGLE_USDC,
             store, expectedRecipient = "0x0000000000000000000000000000000000000000"
         )
-        backend = BackendClient(Config.BACKEND_BASE)
-        settle  = SettlementClient(
+        backend  = BackendClient(Config.BACKEND_BASE)
+        activity = ActivityStore(this)
+        settle   = SettlementClient(
             rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
             chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
             fromAddress = keyVault.address
@@ -111,10 +113,23 @@ class ReceiveActivity : ComponentActivity() {
             store.recent().collect { rows ->
                 val mapped = rows.take(10).map { r ->
                     val amt = "%.2f".format(BigInteger(r.amount).toDouble() / 1e6)
+                    val explorer = r.settledTx?.let { Config.txUrl(it) }
                     when (r.status) {
-                        "settled"  -> RecentRow("Settled on chain", "INCOMING · ${r.voucherId.take(10)}…", "+ \$$amt", true)
-                        "accepted" -> RecentRow("Voucher received", "OFFLINE · PENDING SETTLE", "+ \$$amt", true)
-                        else       -> RecentRow("Rejected voucher", "ERROR · ${r.rejectReason ?: ""}", "  \$$amt", false)
+                        "settled"  -> RecentRow(
+                            "Settled on chain",
+                            "INCOMING · TX ${r.settledTx?.take(10)}…",
+                            "+ \$$amt", true, explorerUrl = explorer,
+                        )
+                        "accepted" -> RecentRow(
+                            "Voucher received",
+                            "OFFLINE · PENDING SETTLE",
+                            "+ \$$amt", true, explorerUrl = null,
+                        )
+                        else       -> RecentRow(
+                            "Rejected voucher",
+                            "ERROR · ${r.rejectReason ?: ""}",
+                            "  \$$amt", false, explorerUrl = null,
+                        )
                     }
                 }
                 state.value = state.value.copy(
@@ -141,6 +156,7 @@ class ReceiveActivity : ComponentActivity() {
             Log.d(TAG, "verify ${v.voucherId.take(10)} -> $result")
             if (result == VerifyResult.VALID) {
                 store.saveAccepted(v)
+                activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())
                 totalAccepted += v.amount.toDouble() / 1e6
             } else {
                 store.saveRejected(v, result.name)
@@ -156,27 +172,93 @@ class ReceiveActivity : ComponentActivity() {
     }
 
     private suspend fun tryAutoSettle(force: Boolean = false) {
-        val pending = store.pendingForSettle()
+        if (!SettleGate.runIfFree { tryAutoSettleInner(force) }) {
+            Log.d(TAG, "tryAutoSettle skipped — another settle in flight")
+        }
+    }
+
+    private suspend fun tryAutoSettleInner(force: Boolean = false) {
+        val all = store.pendingForSettle()
+        val ZERO = "0x0000000000000000000000000000000000000000"
+        // Quarantine non-bearer leftovers.
+        all.filter { it.merchant != ZERO }.forEach {
+            store.markRejected(it.voucherId, "NOT_BEARER")
+            activity.recordFailed("Non-bearer voucher rejected")
+        }
+        var pending = all.filter { it.merchant == ZERO }
         Log.d(TAG, "tryAutoSettle pending=${pending.size} force=$force")
         if (pending.isEmpty()) {
             if (force) state.value = state.value.copy(status = "nothing to settle", statusKind = StatusKind.Idle)
             return
         }
-        state.value = state.value.copy(status = "settling ${pending.size} on chain…", statusKind = StatusKind.Working)
+
+        // Pre-flight: drop vouchers whose payer has no locked funds.
+        val live = mutableListOf<VoucherRow>()
+        var droppedUnbacked = 0
+        for (v in pending) {
+            val locked = runCatching { settle.lockedBalance(v.payer) }
+                .onFailure { Log.w(TAG, "lockedBalance(${v.payer.take(10)}) failed: ${it.message}") }
+                .getOrNull()
+            Log.d(TAG, "preflight payer=${v.payer.take(10)} amount=${v.amount} locked=$locked")
+            if (locked != null && locked < BigInteger(v.amount)) {
+                store.markRejected(v.voucherId, "INSUFFICIENT_LOCKED")
+                activity.recordFailed("Sender has no locked funds — voucher dropped")
+                droppedUnbacked += 1
+            } else {
+                live += v
+            }
+        }
+        pending = live
+        Log.d(TAG, "preflight result: live=${pending.size} unbacked=$droppedUnbacked")
+        if (pending.isEmpty()) {
+            state.value = state.value.copy(
+                status = "skipped $droppedUnbacked unbacked voucher(s)",
+                statusKind = StatusKind.Error,
+            )
+            return
+        }
+        if (droppedUnbacked > 0) {
+            state.value = state.value.copy(
+                status = "skipped $droppedUnbacked unbacked, settling ${pending.size}…",
+                statusKind = StatusKind.Working,
+            )
+        } else {
+            state.value = state.value.copy(
+                status = "settling ${pending.size} on chain…",
+                statusKind = StatusKind.Working,
+            )
+        }
+
         try {
+            Log.d(TAG, "init for gas top-up")
             runCatching { backend.init(keyVault.address, 0L) }
+                .onFailure { Log.w(TAG, "init failed (non-fatal): ${it.message}") }
+            Log.d(TAG, "broadcasting settleBearerBatch for ${pending.size}")
             val tx = try {
                 settle.settleBearerBatch(pending, keyVault.address)
             } catch (t: Throwable) {
-                Log.w(TAG, "direct settle failed, fallback: ${t.message}")
-                relaySettle(pending) ?: throw t
+                Log.w(TAG, "direct settle failed: ${t.message}", t)
+                val isGasIssue = t.message?.contains("insufficient funds") == true ||
+                                 t.message?.contains("nonce") == true
+                if (isGasIssue) {
+                    Log.d(TAG, "falling back to backend relay")
+                    relaySettle(pending) ?: throw t
+                } else throw t
             }
+            Log.d(TAG, "settle tx=$tx")
             pending.forEach { store.markSettled(it.voucherId, tx) }
+            activity.recordSettled(pending.map { it.voucherId }, tx)
             state.value = state.value.copy(status = "⛓ settled ${pending.size} — tx ${tx.take(10)}…",
                 statusKind = StatusKind.Success)
         } catch (t: Throwable) {
             Log.e(TAG, "settle failed", t)
-            state.value = state.value.copy(status = "settle failed: ${t.message}", statusKind = StatusKind.Error)
+            val tag = Errors.rejectTag(t)
+            if (tag != "UNKNOWN" && tag != "ERROR") {
+                pending.forEach { store.markRejected(it.voucherId, tag) }
+            }
+            activity.recordFailed(Errors.friendly(t))
+            state.value = state.value.copy(status = Errors.friendly(t),
+                statusKind = StatusKind.Error)
         }
     }
 

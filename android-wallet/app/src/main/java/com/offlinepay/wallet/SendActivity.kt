@@ -24,6 +24,21 @@ class SendActivity : ComponentActivity() {
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
+        val keyVault = KeyVault(this)
+        val settle   = SettlementClient(
+            rpcUrl = Config.RPC_URL, vaultAddress = Config.VAULT_ADDRESS,
+            chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
+            fromAddress = keyVault.address
+        )
+        // On screen open, check locked balance once. If 0, hint at topup.
+        lifecycleScope.launch {
+            runCatching { settle.lockedBalance(keyVault.address) }.onSuccess { locked ->
+                if (locked.signum() == 0) {
+                    status.value = "no funds locked — top up before sending"
+                    statusKind.value = StatusKind.Error
+                }
+            }
+        }
 
         setContent {
             OffpayTheme {

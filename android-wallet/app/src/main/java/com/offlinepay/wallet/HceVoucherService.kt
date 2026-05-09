@@ -3,6 +3,12 @@ package com.offlinepay.wallet
 import android.nfc.cardemulation.HostApduService
 import android.os.Bundle
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+private val hceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 /// HCE service for the Send role.
 ///
@@ -64,6 +70,28 @@ class HceVoucherService : HostApduService() {
             val len = payload.size
             Log.d(TAG, "signed voucher id=${signed.voucherId.take(10)} len=$len")
             PendingPayment.reportOutgoing(ctx, signed.voucherId, receiver, pending.amountUsdc)
+            // Audit log for sender's "Recent activity" feed. Run on IO scope —
+            // Room rejects writes on the binder thread processCommandApdu uses.
+            val capturedId = signed.voucherId
+            val capturedAmount = pending.amountUsdc.toLong()
+            hceScope.launch {
+                try {
+                    VoucherDb.get(ctx).activityDao().insert(
+                        ActivityRow(
+                            kind = "sent",
+                            amountBaseUnits = capturedAmount,
+                            counterparty = receiver,
+                            voucherId = capturedId,
+                            txHash = null,
+                            ts = System.currentTimeMillis(),
+                            note = "Tapped offline",
+                        )
+                    )
+                    Log.d(TAG, "logged SENT id=${capturedId.take(10)} to=${receiver.take(10)}…")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "could not log activity: ${t.message}")
+                }
+            }
             // Wrap as JSON array to match the receiver's listFromWireJson parser.
             val wireBytes = ("[" + signed.toCardJson() + "]").toByteArray(Charsets.UTF_8)
             val wlen = wireBytes.size
