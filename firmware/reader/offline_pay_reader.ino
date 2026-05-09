@@ -154,6 +154,16 @@ void setup() {
   showReady();
 }
 
+// Per-UID dedup: a MIFARE card sitting on the reader gets re-detected
+// by `PICC_IsNewCardPresent` every loop iteration after a halt(). If we
+// re-enter the read flow each time, we starve BT command processing
+// and spam serial. Track the last processed UID + timestamp; ignore
+// the same card again until either it leaves the field for a moment
+// or DEDUP_MS elapse — whichever happens first.
+#define DEDUP_MS 3000UL
+static String s_lastUid = "";
+static unsigned long s_lastUidMs = 0;
+
 void loop() {
   // Drain any pending BT commands first — pairing / status / future
   // WRITE/WIPE flow. Card detection happens after, so a phone asking
@@ -164,6 +174,15 @@ void loop() {
   if (!rfid.PICC_ReadCardSerial())   { delay(50); return; }
 
   String uid = uidToHex(rfid.uid.uidByte, rfid.uid.size);
+  // Dedup window: same UID inside DEDUP_MS → silently halt and bail
+  // out without printing anything or running the read flow.
+  if (uid == s_lastUid && (millis() - s_lastUidMs) < DEDUP_MS) {
+    halt();
+    delay(80);  // give the BT pump plenty of CPU
+    return;
+  }
+  s_lastUid = uid;
+  s_lastUidMs = millis();
   Serial.println(String("[CARD] uid=") + uid);
 
   String voucherJson = readVoucher();
@@ -587,6 +606,11 @@ void onWrite(const String& line) {
   s_challengeValid = false;
 
   // Wait for a card and write the JSON. Visual cue: solid green.
+  // Reset dedup so a card already on the reader (which the loop
+  // recently skipped) can be picked up here without waiting for the
+  // dedup window to elapse.
+  s_lastUid = "";
+  s_lastUidMs = 0;
   digitalWrite(LED_GREEN, HIGH);
   Serial.print("[write] waiting up to ");
   Serial.print(WRITE_WAIT_MS / 1000);
