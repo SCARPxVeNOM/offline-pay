@@ -204,11 +204,15 @@ void loop() {
   Serial.println(String("[CARD] uid=") + uid);
 
   String voucherJson = readVoucher();
-  // Reject obvious garbage early. A real voucher JSON starts with `{"v":`
-  // and is at least ~200 bytes. Anything shorter is a stale write or an
-  // empty card — bail out fast so we don't enter the 10-second decision
-  // wait (which would eat the phone's WRITE/CHALLENGE traffic).
-  if (voucherJson.length() < 50 || !voucherJson.startsWith("{\"v\"")) {
+  // Reject obvious garbage early. A real voucher JSON contains the
+  // voucherId field (`"i":"0x...`). Anything missing that is a stale
+  // write or an empty card — bail out fast so we don't enter the
+  // 10-second decision wait (which would eat the phone's
+  // WRITE/CHALLENGE traffic).
+  // NOTE: we don't check for `"v":` first-field because the encoder
+  // omits it when it equals the default (= 2) — saves 6 bytes on the
+  // wire so the JSON fits in MIFARE Classic 1K.
+  if (voucherJson.length() < 50 || voucherJson.indexOf("\"i\":\"0x") < 0) {
     Serial.println(String("[CARD] no usable voucher (got '")
                   + voucherJson + "') — skipping read flow");
     flashRed("EMPTY");
