@@ -9,11 +9,14 @@ interface VoucherStoreLike {
 }
 
 /// Vouchers received over NFC by this device, awaiting settle via backend.
+/// `recipient` is part of the on-chain Voucher struct (v3 schema) — bound
+/// at sign time so relay broadcasters can't redirect funds.
 @Entity(tableName = "vouchers")
 data class VoucherRow(
     @PrimaryKey val voucherId: String,
     val payer: String,
     val merchant: String,
+    val recipient: String,
     val amount: String,
     val expiry: Long,
     val nonce: Long,
@@ -116,7 +119,7 @@ interface ActivityDao {
 
 @Database(
     entities = [VoucherRow::class, UnspentRow::class, ActivityRow::class],
-    version = 4, exportSchema = false,
+    version = 5, exportSchema = false,
 )
 abstract class VoucherDb : RoomDatabase() {
     abstract fun voucherDao(): VoucherDao
@@ -141,7 +144,7 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
 
     suspend fun saveAccepted(v: Voucher) {
         dao.insert(VoucherRow(
-            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant,
+            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant, recipient = v.recipient,
             amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
             signature = v.signature,
             status = "accepted", rejectReason = null,
@@ -151,7 +154,7 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
 
     suspend fun saveRejected(v: Voucher, reason: String) {
         dao.insert(VoucherRow(
-            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant,
+            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant, recipient = v.recipient,
             amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
             signature = v.signature,
             status = "rejected", rejectReason = reason,
@@ -166,7 +169,7 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
 
     suspend fun saveReplica(v: Voucher) {
         dao.insert(VoucherRow(
-            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant,
+            voucherId = v.voucherId, payer = v.payer, merchant = v.merchant, recipient = v.recipient,
             amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
             signature = v.signature,
             status = "replica", rejectReason = null,

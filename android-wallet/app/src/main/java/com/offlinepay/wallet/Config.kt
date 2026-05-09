@@ -5,8 +5,11 @@ import java.math.BigInteger
 object Config {
     // Polygon Amoy testnet.
     const val CHAIN_ID = 80002L
-    const val VAULT_ADDRESS  = "0x30b01f8e5Ed5E3b958f0009019fd3f3b9b5d6cE5"
-    const val USDC_ADDRESS   = "0x03Ad909F2b68328ED1606dDD894816978A0CE7a1"
+    // v3 vault: Voucher struct includes `recipient` so anyone can broadcast
+    // settle without redirecting funds. Old vault addresses (v2) cannot be
+    // reused — digest changed.
+    const val VAULT_ADDRESS  = "0x2D8218329389545Cb12b37e2ED961BDB97d3661f"
+    const val USDC_ADDRESS   = "0x17ffe8373658Fb333530e4446becb19dB6239e1e"
 
     // OFFPAY backend on AWS EC2 (Sydney), dual-stack v4 + v6.
     // Phone networks vary: Airtel/Jio LTE = IPv6-only, home Wi-Fi = IPv4-only.

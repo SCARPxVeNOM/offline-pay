@@ -102,7 +102,8 @@ class MeshBroadcaster(
             type = "replica",
             voucherId = v.voucherId,
             payload = CardVoucherPayload(
-                voucherId = v.voucherId, payer = v.payer, merchant = v.merchant,
+                voucherId = v.voucherId, payer = v.payer,
+                merchant = v.merchant, recipient = v.recipient,
                 amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
                 signature = v.signature
             ),

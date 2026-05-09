@@ -4,25 +4,29 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.json.Json
 
-/// Compact card payload as written on the MIFARE card, matching the JSON
-/// produced by `backend/src/voucher.js:voucherToCardJson`.
+/// Compact card payload that crosses NFC / QR. v2 schema includes `recipient`
+/// so a relay broadcaster can settle on the offline pair's behalf without
+/// being able to redirect the funds.
 @Serializable
 data class CardVoucherPayload(
-    @SerialName("v") val version: Int = 1,
+    @SerialName("v") val version: Int = 2,
     @SerialName("i") val voucherId: String,
     @SerialName("p") val payer: String,
     @SerialName("m") val merchant: String,
+    @SerialName("r") val recipient: String,
     @SerialName("a") val amount: String,
     @SerialName("e") val expiry: Long,
     @SerialName("n") val nonce: Long,
     @SerialName("s") val signature: String
 )
 
-/// In-memory voucher fields (fully-typed) used by the verifier and Room DAO.
+/// In-memory voucher fields used by verifier + Room DAO. `recipient` is
+/// part of the digest now — the address the sender chose at sign time.
 data class Voucher(
     val voucherId: String,
     val payer: String,
     val merchant: String,
+    val recipient: String,
     val amount: java.math.BigInteger,
     val expiry: Long,
     val nonce: Long,
@@ -33,6 +37,7 @@ data class Voucher(
             voucherId = p.voucherId,
             payer     = p.payer,
             merchant  = p.merchant,
+            recipient = p.recipient,
             amount    = java.math.BigInteger(p.amount),
             expiry    = p.expiry,
             nonce     = p.nonce,
@@ -41,10 +46,10 @@ data class Voucher(
     }
 }
 
-private val cardJson = Json { encodeDefaults = true }
+private val cardJson = Json { encodeDefaults = true; ignoreUnknownKeys = true }
 
-/// Serialize a freshly-signed voucher into the same compact JSON the
-/// merchant phone parses on receive (matches backend voucher.js output).
+/// Serialize a freshly-signed voucher into the wire JSON. Matches
+/// backend/voucher.js:voucherToCardJson byte-for-byte.
 fun VoucherSigner.SignedVoucher.toCardJson(): String =
     cardJson.encodeToString(
         CardVoucherPayload.serializer(),
@@ -52,6 +57,7 @@ fun VoucherSigner.SignedVoucher.toCardJson(): String =
             voucherId = voucherId,
             payer     = payer,
             merchant  = merchant,
+            recipient = recipient,
             amount    = amount.toString(),
             expiry    = expiry,
             nonce     = nonce,

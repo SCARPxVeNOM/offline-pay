@@ -8,6 +8,8 @@ export const signer   = new ethers.NonceManager(wallet);
 // Convenience: expose the address (NonceManager doesn't have .address until awaited).
 signer.address = wallet.address;
 
+// v3 Voucher struct: (payer, merchant, recipient, amount, expiry, nonce, voucherId)
+const VOUCHER = "(address,address,address,uint256,uint256,uint256,bytes32)";
 const VAULT_ABI = [
   "function lockFunds(uint256 amount)",
   "function unlock(uint256 amount)",
@@ -16,11 +18,13 @@ const VAULT_ABI = [
   "function usedVouchers(bytes32) view returns (bool)",
   "function maxSinglePayment() view returns (uint256)",
   "function maxLockedBalance() view returns (uint256)",
-  "function settleVoucher((address,address,uint256,uint256,uint256,bytes32),bytes)",
-  "function settleBatch((address,address,uint256,uint256,uint256,bytes32)[],bytes[])",
-  "function settleBearer((address,address,uint256,uint256,uint256,bytes32),bytes,address)",
-  "function settleBearerBatch((address,address,uint256,uint256,uint256,bytes32)[],bytes[],address)",
-  "event VoucherSettled(bytes32 indexed voucherId, address indexed payer, address indexed merchant, uint256 amount, uint256 nonce)",
+  `function settleVoucher(${VOUCHER},bytes)`,
+  `function settleBatch(${VOUCHER}[],bytes[])`,
+  // settleBearer / settleBearerBatch — recipient is now embedded in the voucher,
+  // not a separate argument, so anyone can broadcast (relay-friendly).
+  `function settleBearer(${VOUCHER},bytes)`,
+  `function settleBearerBatch(${VOUCHER}[],bytes[])`,
+  "event VoucherSettled(bytes32 indexed voucherId, address indexed payer, address indexed recipient, uint256 amount, uint256 nonce)",
   "event FundsLocked(address indexed payer, uint256 amount, uint256 newBalance)"
 ];
 

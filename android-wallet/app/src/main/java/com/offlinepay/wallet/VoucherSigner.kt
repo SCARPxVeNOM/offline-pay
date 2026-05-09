@@ -13,13 +13,11 @@ import java.security.SecureRandom
 
 /// Builds and signs vouchers locally using the customer's secp256k1 key.
 /// Output is byte-compatible with backend/src/voucher.js and on-chain
-/// `OfflineVault.voucherDigest`.
+/// `OfflineVault.voucherDigest` (v3 schema includes recipient).
 ///
 /// Production callers MUST use [signNext] so every voucher draws its nonce
-/// from the single persisted [NonceTracker] — re-using a nonce is what
-/// causes the "stale nonce" revert on the second-to-settle voucher. The
-/// raw [sign] entrypoint is kept for tests and the legacy custodial path
-/// where the backend manages the nonce.
+/// from the single persisted [NonceTracker]. The raw [sign] entrypoint is
+/// kept for tests where the caller manages nonce explicitly.
 class VoucherSigner(
     private val chainId: Long,
     private val vaultAddress: String,
@@ -28,52 +26,73 @@ class VoucherSigner(
     private val nonces: NonceTracker? = null,
 ) {
     data class SignedVoucher(
-        val payer: String, val merchant: String,
-        val amount: BigInteger, val expiry: Long, val nonce: Long,
-        val voucherId: String, val signature: String
+        val payer: String,
+        val merchant: String,
+        val recipient: String,
+        val amount: BigInteger,
+        val expiry: Long,
+        val nonce: Long,
+        val voucherId: String,
+        val signature: String,
     )
 
     /// THE ONE call site for locally-signed vouchers in this app. Allocates
     /// the next nonce atomically (commit-backed) and never re-derives from
-    /// getLast() afterwards.
+    /// getLast() afterwards. `recipient` is bound at sign time — relay
+    /// broadcasters cannot redirect funds.
     fun signNext(
         merchant: String?,
+        recipient: String,
         amountUsdc: BigInteger,
         ttlSeconds: Long,
     ): SignedVoucher {
         val tracker = nonces
             ?: error("VoucherSigner constructed without NonceTracker — refuse to sign")
-        return sign(merchant, amountUsdc, ttlSeconds, tracker.next())
+        return sign(merchant, recipient, amountUsdc, ttlSeconds, tracker.next())
     }
 
     /// Test/legacy entrypoint. Production code must call [signNext] instead.
     fun sign(
         merchant: String?,
+        recipient: String,
         amountUsdc: BigInteger,
         ttlSeconds: Long,
-        nonce: Long
+        nonce: Long,
     ): SignedVoucher {
         val voucherId = randomBytes32Hex()
         val expiry    = System.currentTimeMillis() / 1000 + ttlSeconds
-        val merchantAddr = merchant?.takeIf { it.isNotBlank() } ?: ZERO_ADDR
+        val merchantAddr  = merchant?.takeIf { it.isNotBlank() } ?: ZERO_ADDR
+        val recipientAddr = recipient.takeIf { it.isNotBlank() } ?: ZERO_ADDR
 
-        val digest = digest(payerAddress, merchantAddr, amountUsdc, expiry, nonce, voucherId)
+        val digest = digest(payerAddress, merchantAddr, recipientAddr, amountUsdc, expiry, nonce, voucherId)
         val ethDigest = Sign.getEthereumMessageHash(digest)
 
         val sig = Sign.signMessage(ethDigest, keyPair, false)
         val sigHex = Numeric.toHexString(sig.r) + Numeric.toHexStringNoPrefix(sig.s) +
                      String.format("%02x", sig.v[0].toInt() and 0xFF)
 
-        return SignedVoucher(payerAddress, merchantAddr, amountUsdc, expiry, nonce, voucherId, sigHex)
+        return SignedVoucher(
+            payer = payerAddress,
+            merchant = merchantAddr,
+            recipient = recipientAddr,
+            amount = amountUsdc,
+            expiry = expiry,
+            nonce = nonce,
+            voucherId = voucherId,
+            signature = sigHex,
+        )
     }
 
+    /// keccak256(abi.encode(payer, merchant, recipient, amount, expiry, nonce,
+    ///                      voucherId, chainId, vault))
     private fun digest(
-        payer: String, merchant: String, amount: BigInteger,
+        payer: String, merchant: String, recipient: String, amount: BigInteger,
         expiry: Long, nonce: Long, voucherId: String
     ): ByteArray {
         val encoded =
             TypeEncoder.encode(Address(payer)) +
             TypeEncoder.encode(Address(merchant)) +
+            TypeEncoder.encode(Address(recipient)) +
             TypeEncoder.encode(Uint256(amount)) +
             TypeEncoder.encode(Uint256(expiry)) +
             TypeEncoder.encode(Uint256(nonce)) +

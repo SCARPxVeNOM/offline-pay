@@ -1,10 +1,11 @@
-// End-to-end test for the Option B custodial-fallback protocol.
+// End-to-end test for the v3 recipient-bound bearer flow.
 //
-// Spins up two ephemeral wallets, drives the exact same flow as the Android
-// app would: backend init → user-signed approve+lock → offline-style voucher
-// → backend init for receiver → receiver-signed settleBearerBatch.
+// Spins up THREE ephemeral wallets to prove the headline mesh property:
+//   - sender + receiver are offline (we just don't broadcast from them)
+//   - relay broadcasts settleBearerBatch
+//   - funds land at the receiver's address (signed in the digest)
 //
-// If this passes, the protocol works. UI is just chrome.
+// If this passes, the protocol works.
 import "dotenv/config";
 import { ethers } from "ethers";
 import { config } from "./config.js";
@@ -15,11 +16,11 @@ const VAULT = config.vault;
 const USDC  = config.usdc;
 const CHAIN_ID = config.chainId;
 
+const VOUCHER = "(address,address,address,uint256,uint256,uint256,bytes32)";
 const VAULT_ABI = [
   "function lockedBalance(address) view returns (uint256)",
   "function lockFunds(uint256)",
-  "function settleBearerBatch((address,address,uint256,uint256,uint256,bytes32)[],bytes[],address)",
-  "function voucherDigest((address,address,uint256,uint256,uint256,bytes32)) view returns (bytes32)",
+  `function settleBearerBatch(${VOUCHER}[],bytes[])`,
 ];
 const USDC_ABI = [
   "function balanceOf(address) view returns (uint256)",
@@ -50,14 +51,10 @@ async function step1_topupSender(sender, amountUsdc) {
   const init = await backendInit(sender.address, amountUsdc);
   log(`    backend init done in ${Date.now() - t0}ms, txs:`, init.txs);
 
-  // Mirror approveAndLock — both txs with sequential nonces.
   const baseNonce = await provider.getTransactionCount(sender.address, "pending");
-  const usdc  = new ethers.Contract(USDC, USDC_ABI, sender);
+  const usdc  = new ethers.Contract(USDC,  USDC_ABI,  sender);
   const vault = new ethers.Contract(VAULT, VAULT_ABI, sender);
   const t1 = Date.now();
-  // Explicit gasLimit so ethers skips eth_estimateGas — otherwise the gas
-  // estimator simulates lockFunds against the latest block, where approve
-  // hasn't mined yet, and reverts with InsufficientAllowance.
   const approveTx = await usdc.approve(VAULT, amountUsdc, {
     nonce: baseNonce, gasLimit: 100_000n,
   });
@@ -70,91 +67,107 @@ async function step1_topupSender(sender, amountUsdc) {
   if (aRcpt.status !== 1) throw new Error(`approve reverted: ${approveTx.hash}`);
   if (lRcpt.status !== 1) throw new Error(`lock reverted: ${lockTx.hash}`);
 
-  const locked = await vaultRO.lockedBalance(sender.address);
+  // Infura's read replicas lag the canonical chain by 1-2s after a write.
+  // Retry briefly so the test doesn't false-positive on read staleness.
+  let locked = 0n;
+  for (let i = 0; i < 10; i++) {
+    locked = await vaultRO.lockedBalance(sender.address);
+    if (locked >= amountUsdc) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
   log(`    lockedBalance[sender] = ${fmt(locked)} USDC`);
   if (locked < amountUsdc) throw new Error(`lock mismatch: got ${locked}`);
   return lockTx.hash;
 }
 
-async function step2_signVoucher(sender, amountBaseUnits, voucherNonce) {
-  // Match the Kotlin VoucherSigner exactly:
-  //   keccak(abi.encode(payer, merchant=0, amount, expiry, nonce, voucherId, chainId, vault))
-  //   then EIP-191 personal_sign over that digest.
+/// Signs a voucher with v3 digest:
+///   (payer, merchant=0, recipient, amount, expiry, nonce, voucherId, chainId, vault)
+async function step2_signVoucher(sender, recipient, amountBaseUnits, voucherNonce) {
   const payer = sender.address;
   const merchant = ethers.ZeroAddress;
   const expiry = BigInt(Math.floor(Date.now() / 1000) + 3600);
   const voucherId = ethers.id(`voucher-${Date.now()}-${Math.random()}`);
   const v = {
-    payer, merchant,
+    payer, merchant, recipient,
     amount: BigInt(amountBaseUnits),
     expiry, nonce: BigInt(voucherNonce), voucherId,
   };
-  const digest = ethers.AbiCoder.defaultAbiCoder().encode(
-    ["address","address","uint256","uint256","uint256","bytes32","uint256","address"],
-    [v.payer, v.merchant, v.amount, v.expiry, v.nonce, v.voucherId, CHAIN_ID, VAULT]
+  const digestEnc = ethers.AbiCoder.defaultAbiCoder().encode(
+    ["address","address","address","uint256","uint256","uint256","bytes32","uint256","address"],
+    [v.payer, v.merchant, v.recipient, v.amount, v.expiry, v.nonce, v.voucherId, CHAIN_ID, VAULT]
   );
-  const hash = ethers.keccak256(digest);
+  const hash = ethers.keccak256(digestEnc);
   const signature = await sender.signMessage(ethers.getBytes(hash));
-  log(`(2) signed voucher id=${v.voucherId.slice(0, 10)}… amount=${fmt(v.amount)}`);
+  log(`(2) signed voucher id=${v.voucherId.slice(0, 10)}… amount=${fmt(v.amount)} → recipient=${recipient.slice(0, 10)}…`);
   return { v, signature };
 }
 
-async function step3_receiverSettles(receiver, voucher, signature, recipient) {
-  log(`(3) receiver init for gas`);
-  await backendInit(receiver.address, 0n);
-
-  log(`    receiver broadcasts settleBearerBatch from ${receiver.address}`);
-  const vault = new ethers.Contract(VAULT, VAULT_ABI, receiver);
-  const tuple = [voucher.payer, voucher.merchant, voucher.amount,
-                 voucher.expiry, voucher.nonce, voucher.voucherId];
+/// Relay broadcasts the settle. msg.sender is `relay`, but funds land at
+/// the voucher's signed `recipient` field.
+async function step3_relayBroadcasts(relay, voucher, signature) {
+  log(`(3) relay broadcasts settleBearerBatch from ${relay.address}`);
+  await backendInit(relay.address, 0n);  // fund relay with gas
+  const vault = new ethers.Contract(VAULT, VAULT_ABI, relay);
+  const tuple = [
+    voucher.payer, voucher.merchant, voucher.recipient,
+    voucher.amount, voucher.expiry, voucher.nonce, voucher.voucherId,
+  ];
   const t0 = Date.now();
-  const tx = await vault.settleBearerBatch([tuple], [signature], recipient);
+  const tx = await vault.settleBearerBatch([tuple], [signature]);
   log(`    submitted ${tx.hash.slice(0, 10)}…`);
   const rcpt = await tx.wait();
-  log(`    mined in ${Date.now() - t0}ms blockNumber=${rcpt.blockNumber}`);
+  log(`    mined in ${Date.now() - t0}ms blockNumber=${rcpt.blockNumber} status=${rcpt.status}`);
+  if (rcpt.status !== 1) throw new Error(`settle reverted: ${tx.hash}`);
   return rcpt.hash;
 }
 
 async function main() {
   log("config:", { rpc: RPC, vault: VAULT, usdc: USDC, chainId: CHAIN_ID });
 
-  // Health check
   const h = await fetch(`${BACKEND}/api/health`).then(r => r.json());
   if (!h.ok) throw new Error("backend not healthy");
   log("backend ok at block", h.blockNumber);
 
-  // Two fresh ephemeral wallets.
+  // Three independent wallets — sender, receiver, relay.
   const sender   = ethers.Wallet.createRandom().connect(provider);
   const receiver = ethers.Wallet.createRandom().connect(provider);
+  const relay    = ethers.Wallet.createRandom().connect(provider);
   log(`sender   = ${sender.address}`);
   log(`receiver = ${receiver.address}`);
+  log(`relay    = ${relay.address} (broadcaster — never touches funds)`);
 
-  const amount = 1_000_000n;     // $1.00 locked
-  const voucherAmt = 500_000n;   // $0.50 paid
+  const amount     = 1_000_000n;     // $1.00 locked
+  const voucherAmt =   500_000n;     // $0.50 paid
 
   await step1_topupSender(sender, amount);
 
-  // Sender's nonce starts at 1 (lastNonce[payer] init = 0).
-  const { v, signature } = await step2_signVoucher(sender, voucherAmt, 1);
+  // Sender signs a voucher specifying receiver as the recipient.
+  const { v, signature } = await step2_signVoucher(sender, receiver.address, voucherAmt, 1);
 
-  const balBefore = await usdcRO.balanceOf(receiver.address);
-  log(`receiver USDC balance before = ${fmt(balBefore)}`);
+  const recvBefore  = await usdcRO.balanceOf(receiver.address);
+  const relayBefore = await usdcRO.balanceOf(relay.address);
+  log(`receiver USDC before = ${fmt(recvBefore)}, relay USDC before = ${fmt(relayBefore)}`);
 
-  const settleTx = await step3_receiverSettles(receiver, v, signature, receiver.address);
+  const settleTx = await step3_relayBroadcasts(relay, v, signature);
 
-  const balAfter = await usdcRO.balanceOf(receiver.address);
-  log(`receiver USDC balance after  = ${fmt(balAfter)}`);
-  if (balAfter - balBefore !== voucherAmt)
-    throw new Error(`receiver balance delta mismatch: ${balAfter - balBefore}`);
+  const recvAfter  = await usdcRO.balanceOf(receiver.address);
+  const relayAfter = await usdcRO.balanceOf(relay.address);
+  log(`receiver USDC after  = ${fmt(recvAfter)}, relay USDC after = ${fmt(relayAfter)}`);
+
+  if (recvAfter - recvBefore !== voucherAmt)
+    throw new Error(`receiver delta mismatch: ${recvAfter - recvBefore}`);
+  if (relayAfter !== relayBefore)
+    throw new Error(`relay should not receive funds: ${relayAfter}`);
 
   const lockedAfter = await vaultRO.lockedBalance(sender.address);
-  log(`sender locked after = ${fmt(lockedAfter)} USDC`);
+  log(`sender locked after  = ${fmt(lockedAfter)} USDC (was ${fmt(amount)})`);
   if (lockedAfter !== amount - voucherAmt)
     throw new Error(`sender locked mismatch: ${lockedAfter}`);
 
   log("====================================");
-  log("✅ END-TO-END PROTOCOL TEST PASSED");
-  log(`   topup → voucher → settle on Polygon Amoy`);
+  log("✅ V3 RELAY E2E TEST PASSED");
+  log(`   sender → vault → receiver, broadcast by RELAY (third wallet)`);
+  log(`   relay never received funds — recipient binding works.`);
   log(`   settle tx: https://amoy.polygonscan.com/tx/${settleTx}`);
   log("====================================");
 }

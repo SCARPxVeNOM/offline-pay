@@ -60,12 +60,16 @@ class HceVoucherService : HostApduService() {
                 payerAddress = keyVault.address,
                 nonces = nonces
             )
-            // Bearer voucher (merchant=null=0x0): receiver settles bearer
-            // batch on-chain. We set merchant to bearer for cross-receiver
-            // flexibility; if you want strict recipient-binding, pass
-            // merchant=receiver here instead.
+            // Bearer voucher (merchant=0x0). recipient = receiver address
+            // from the 0xC1 APDU. Anyone can broadcast settle, but funds
+            // flow only to this recipient — the digest is signed over it.
             val ttl = (pending.expiry - System.currentTimeMillis() / 1000).coerceAtLeast(60)
-            val signed = signer.signNext(merchant = null, amountUsdc = pending.amountUsdc, ttlSeconds = ttl)
+            val signed = signer.signNext(
+                merchant   = null,
+                recipient  = receiver,
+                amountUsdc = pending.amountUsdc,
+                ttlSeconds = ttl,
+            )
             val payload = signed.toCardJson().toByteArray(Charsets.UTF_8)
             val len = payload.size
             Log.d(TAG, "signed voucher id=${signed.voucherId.take(10)} len=$len")

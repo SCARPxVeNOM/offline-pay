@@ -142,9 +142,14 @@ app.post("/api/vouchers/issue", async (req, res) => {
     const issued = [];
     for (let i = 0; i < count; i++) {
       nonce += 1;
+      // v3 requires a recipient at sign time so a relay broadcaster can't
+      // redirect funds. The legacy /api/vouchers/issue caller should supply
+      // a recipient in the request body. Falling back to the requested
+      // `customer` keeps backward compat for the old test scripts.
       const voucher = buildVoucher({
         payer: signer.address,         // custodial path
         merchant: ethers.ZeroAddress,  // bearer
+        recipient: req.body?.recipient || customer,
         amountUsdc: amt,
         ttlSeconds: 24 * 3600,
         nonce
@@ -162,6 +167,7 @@ app.post("/api/vouchers/issue", async (req, res) => {
         voucher: {
           payer: voucher.payer,
           merchant: voucher.merchant,
+          recipient: voucher.recipient,
           amount: voucher.amount.toString(),
           expiry: Number(voucher.expiry),
           nonce: Number(voucher.nonce),
@@ -222,9 +228,13 @@ app.post("/api/wallet/topup", async (req, res) => {
       const issued = [];
       for (let i = 0; i < n; i++) {
         nonce += 1;
+        // v3: recipient required at sign time. The legacy bearer-pre-sign
+        // model picked any address claiming on tap; with the new digest we
+        // need to know who will receive. Default to the calling address.
         const voucher = buildVoucher({
           payer: signer.address,
           merchant: ethers.ZeroAddress,
+          recipient: address,
           amountUsdc: denom,
           ttlSeconds: 24 * 3600,
           nonce
@@ -241,6 +251,7 @@ app.post("/api/wallet/topup", async (req, res) => {
         issued.push({
           voucher: {
             payer: voucher.payer, merchant: voucher.merchant,
+            recipient: voucher.recipient,
             amount: voucher.amount.toString(),
             expiry: Number(voucher.expiry), nonce: Number(voucher.nonce),
             voucherId: voucher.voucherId
@@ -313,14 +324,19 @@ app.post("/api/wallet/init", async (req, res) => {
   }
 });
 
-// ─── Receiver pushes received vouchers; backend settles on-chain to recipient ───
-// Body: { recipient, vouchers: [{ voucher, signature }] }
+// ─── Relay-broadcast: backend settles vouchers on chain ────────────────
+// v3 schema: each voucher carries its own `recipient` field signed by the
+// payer. msg.sender (backend's wallet) doesn't need to be the recipient —
+// funds always flow to the address the payer chose at sign time. This is
+// the relay path used when the receiver's own wallet has no MATIC, or for
+// any third-party mesh peer to broadcast on behalf of an offline pair.
+//
+// Body: { vouchers: [{ voucher, signature }] }
 // Response: { ok, settled: N, tx: '0x…', rejected: [{voucherId, reason}] }
 app.post("/api/wallet/redeem", async (req, res) => {
   if (!vault) return res.status(503).json({ error: "chain not configured" });
   try {
-    const { recipient, vouchers } = req.body || {};
-    if (!ethers.isAddress(recipient)) return res.status(400).json({ error: "bad recipient" });
+    const { vouchers } = req.body || {};
     if (!Array.isArray(vouchers) || vouchers.length === 0)
       return res.status(400).json({ error: "vouchers[] required" });
 
@@ -331,6 +347,9 @@ app.post("/api/wallet/redeem", async (req, res) => {
       try {
         if (v.merchant && v.merchant.toLowerCase() !== ethers.ZeroAddress.toLowerCase())
           throw new Error("not bearer");
+        if (!v.recipient || !ethers.isAddress(v.recipient) ||
+            v.recipient.toLowerCase() === ethers.ZeroAddress.toLowerCase())
+          throw new Error("missing recipient");
         const recovered = recoverVoucherSigner(v, item.signature);
         if (recovered.toLowerCase() !== v.payer.toLowerCase()) throw new Error("bad sig");
         const existing = db.prepare("SELECT status FROM vouchers WHERE voucher_id=?").get(v.voucherId);
@@ -344,12 +363,12 @@ app.post("/api/wallet/redeem", async (req, res) => {
 
     const result = await withChainLock(async () => {
       const vs = ok.map(it => [
-        it.voucher.payer, it.voucher.merchant,
+        it.voucher.payer, it.voucher.merchant, it.voucher.recipient,
         BigInt(it.voucher.amount), BigInt(it.voucher.expiry),
-        BigInt(it.voucher.nonce), it.voucher.voucherId
+        BigInt(it.voucher.nonce), it.voucher.voucherId,
       ]);
       const sigs = ok.map(it => it.signature);
-      const tx = await vault.settleBearerBatch(vs, sigs, recipient);
+      const tx = await vault.settleBearerBatch(vs, sigs);
       const rcpt = await tx.wait();
       for (const it of ok) {
         db.prepare(
@@ -402,12 +421,14 @@ app.post("/api/merchant/settle", async (req, res) => {
     ).all();
     if (!rows.length) return res.json({ settled: 0 });
 
-    // Tuples are passed positionally because the ABI declares them with
-    // unnamed components. Order MUST match Voucher struct in OfflineVault.sol:
-    // (payer, merchant, amount, expiry, nonce, voucherId).
+    // v3 Voucher: (payer, merchant, recipient, amount, expiry, nonce, voucherId).
+    // Legacy `redeemed` rows pre-date the recipient field; the column may not
+    // exist in the SQLite schema. Fall back to the merchant address (legacy
+    // model) so this old endpoint at least produces a self-consistent tuple.
     const vs = rows.map(r => [
       r.payer,
       r.merchant,
+      r.recipient || r.merchant,
       BigInt(r.amount),
       BigInt(r.expiry),
       BigInt(r.nonce),

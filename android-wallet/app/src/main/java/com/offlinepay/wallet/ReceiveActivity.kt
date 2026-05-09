@@ -274,7 +274,7 @@ class ReceiveActivity : ComponentActivity() {
                 .onFailure { Log.w(TAG, "init failed (non-fatal): ${it.message}") }
             Log.d(TAG, "broadcasting settleBearerBatch for ${pending.size}")
             val tx = try {
-                settle.settleBearerBatch(pending, keyVault.address)
+                settle.settleBearerBatch(pending)
             } catch (t: Throwable) {
                 Log.w(TAG, "direct settle failed: ${t.message}", t)
                 val isGasIssue = t.message?.contains("insufficient funds") == true ||
@@ -305,14 +305,14 @@ class ReceiveActivity : ComponentActivity() {
         val items = pending.map {
             BackendClient.RedeemItem(
                 voucher = BackendClient.VoucherFields(
-                    payer = it.payer, merchant = it.merchant,
+                    payer = it.payer, merchant = it.merchant, recipient = it.recipient,
                     amount = it.amount, expiry = it.expiry,
                     nonce = it.nonce, voucherId = it.voucherId
                 ),
                 signature = it.signature
             )
         }
-        val resp = backend.redeem(keyVault.address, items)
+        val resp = backend.redeem(items)
         return if (resp.ok) resp.tx else null
     }
 

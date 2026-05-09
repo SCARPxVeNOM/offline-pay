@@ -15,6 +15,10 @@ interface IMerchantRegistry {
 /// @title OfflineVault — settlement layer for OfflinePay vouchers.
 /// @notice Customers lock USDC, sign offline vouchers (bearer or fixed-merchant),
 ///         and merchants redeem them on-chain when they reconnect.
+/// @dev    v3: voucher carries a `recipient` field signed by the payer. Anyone
+///         can broadcast a settle (relay-friendly) but funds always flow to the
+///         signer-chosen recipient. Critical for mesh relay where a third
+///         phone with internet broadcasts on the offline pair's behalf.
 contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
     using ECDSA for bytes32;
     using MessageHashUtils for bytes32;
@@ -40,19 +44,25 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
     event VoucherSettled(
         bytes32 indexed voucherId,
         address indexed payer,
-        address indexed merchant,
+        address indexed recipient,
         uint256 amount,
         uint256 nonce
     );
     event LimitsUpdated(uint256 maxSingle, uint256 maxBalance, uint256 ttl);
     event MerchantRegistryUpdated(address indexed registry);
 
+    /// @notice Voucher signed by `payer`. `recipient` is part of the signed
+    ///         digest, so a relay node can broadcast settle on behalf of an
+    ///         offline pair without ever being able to redirect funds.
+    /// @dev    `merchant` is kept as a 0x0 placeholder for the bearer flow;
+    ///         legacy fixed-merchant uses it directly.
     struct Voucher {
         address payer;       // funds owner
-        address merchant;    // address(0) = bearer (any merchant can claim)
+        address merchant;    // address(0) = bearer (use settleBearer*); else legacy fixed-merchant
+        address recipient;   // who receives the funds — bound at signing time
         uint256 amount;      // USDC base units (6 decimals)
         uint256 expiry;      // unix seconds
-        uint256 nonce;       // strictly increasing per payer
+        uint256 nonce;       // strictly increasing per payer (legacy path); ignored in bearer path
         bytes32 voucherId;   // unique id (uuid hashed or random bytes32)
     }
 
@@ -81,7 +91,7 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         emit FundsUnlocked(msg.sender, amount, lockedBalance[msg.sender]);
     }
 
-    // ─── Merchant settlement ────────────────────────────────────────
+    // ─── Merchant settlement (legacy fixed-merchant path) ────────────
 
     /// @notice Settle a single voucher signed by `voucher.payer`.
     /// @dev If merchant==0 the voucher is bearer and anyone (msg.sender) can redeem.
@@ -107,10 +117,6 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
     }
 
     /// @notice Settle a voucher claimed by an authorized device key.
-    /// @dev    msg.sender is a device (phone/ESP32). The registry resolves it
-    ///         to the merchant's primary wallet, which receives the funds.
-    ///         The voucher's `merchant` field must equal the primary wallet
-    ///         (or be address(0) for bearer).
     function settleVoucherAsDevice(Voucher calldata v, bytes calldata sig)
         external
         whenNotPaused
@@ -139,36 +145,36 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         require(primary != address(0), "device not authorized");
     }
 
-    /// @notice Bearer settle — pays `recipient` (not msg.sender) and skips the
-    ///         per-payer nonce monotonicity check. Used by the custodial relay
-    ///         path where one backend wallet co-signs vouchers for many users
-    ///         simultaneously: out-of-order settles by independent receivers
-    ///         would otherwise invalidate lower-nonce vouchers in flight.
-    ///         Replay protection is preserved by `usedVouchers[voucherId]`.
-    function settleBearer(Voucher calldata v, bytes calldata sig, address recipient)
+    // ─── Bearer settle (relay-friendly) ──────────────────────────────
+
+    /// @notice Bearer settle. Funds flow to `voucher.recipient` (signed by payer).
+    ///         msg.sender can be anyone — this is the mesh-relay path. Replay is
+    ///         guarded by `usedVouchers[voucherId]`; per-payer nonce check skipped
+    ///         because multiple offline receivers may settle out of order.
+    function settleBearer(Voucher calldata v, bytes calldata sig)
         external
         whenNotPaused
         nonReentrant
     {
         require(v.merchant == address(0), "not bearer");
-        require(recipient != address(0), "recipient=0");
-        _settleBearer(v, sig, recipient);
+        require(v.recipient != address(0), "recipient=0");
+        _settleBearer(v, sig);
     }
 
-    function settleBearerBatch(Voucher[] calldata vs, bytes[] calldata sigs, address recipient)
+    function settleBearerBatch(Voucher[] calldata vs, bytes[] calldata sigs)
         external
         whenNotPaused
         nonReentrant
     {
         require(vs.length == sigs.length, "len mismatch");
-        require(recipient != address(0), "recipient=0");
         for (uint256 i = 0; i < vs.length; i++) {
             require(vs[i].merchant == address(0), "not bearer");
-            _settleBearer(vs[i], sigs[i], recipient);
+            require(vs[i].recipient != address(0), "recipient=0");
+            _settleBearer(vs[i], sigs[i]);
         }
     }
 
-    function _settleBearer(Voucher calldata v, bytes calldata sig, address recipient) internal {
+    function _settleBearer(Voucher calldata v, bytes calldata sig) internal {
         require(!usedVouchers[v.voucherId], "already settled");
         require(block.timestamp <= v.expiry, "expired");
         require(v.amount > 0 && v.amount <= maxSinglePayment, "bad amount");
@@ -179,12 +185,10 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
         require(recovered == v.payer, "bad signature");
 
         usedVouchers[v.voucherId] = true;
-        // Note: NO lastNonce update. voucherId uniqueness is the sole
-        // anti-replay mechanism here.
         lockedBalance[v.payer] -= v.amount;
 
-        require(usdc.transfer(recipient, v.amount), "payout failed");
-        emit VoucherSettled(v.voucherId, v.payer, recipient, v.amount, v.nonce);
+        require(usdc.transfer(v.recipient, v.amount), "payout failed");
+        emit VoucherSettled(v.voucherId, v.payer, v.recipient, v.amount, v.nonce);
     }
 
     function _settle(Voucher calldata v, bytes calldata sig, address claimer) internal {
@@ -214,11 +218,13 @@ contract OfflineVault is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Off-chain signers MUST hash exactly these fields, in this order,
     ///         then prepend the EIP-191 prefix before signing. The chainId is
-    ///         baked in to prevent cross-chain replay.
+    ///         baked in to prevent cross-chain replay. `recipient` is in the
+    ///         digest so relay-broadcasters cannot redirect funds.
     function voucherDigest(Voucher calldata v) public view returns (bytes32) {
         return keccak256(abi.encode(
             v.payer,
             v.merchant,
+            v.recipient,
             v.amount,
             v.expiry,
             v.nonce,

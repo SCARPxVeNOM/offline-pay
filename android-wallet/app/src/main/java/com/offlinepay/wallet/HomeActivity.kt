@@ -127,7 +127,8 @@ class HomeActivity : ComponentActivity() {
                     if (row.status == "accepted" && seenIds.add(row.voucherId)) {
                         val v = Voucher(
                             voucherId = row.voucherId, payer = row.payer,
-                            merchant = row.merchant, amount = BigInteger(row.amount),
+                            merchant = row.merchant, recipient = row.recipient,
+                            amount = BigInteger(row.amount),
                             expiry = row.expiry, nonce = row.nonce, signature = row.signature,
                         )
                         mesh.broadcast(v)
@@ -250,7 +251,7 @@ class HomeActivity : ComponentActivity() {
         try {
             runCatching { backend.init(keyVault.address, 0L) }
             val tx = try {
-                settle.settleBearerBatch(pending, keyVault.address)
+                settle.settleBearerBatch(pending)
             } catch (t: Throwable) {
                 Log.w(TAG, "direct settle failed: ${t.message}")
                 // Try backend relay only if the failure is gas-related; on-chain
@@ -261,14 +262,14 @@ class HomeActivity : ComponentActivity() {
                     val items = pending.map {
                         BackendClient.RedeemItem(
                             voucher = BackendClient.VoucherFields(
-                                payer = it.payer, merchant = it.merchant,
+                                payer = it.payer, merchant = it.merchant, recipient = it.recipient,
                                 amount = it.amount, expiry = it.expiry,
                                 nonce = it.nonce, voucherId = it.voucherId
                             ),
                             signature = it.signature
                         )
                     }
-                    val resp = backend.redeem(keyVault.address, items)
+                    val resp = backend.redeem(items)
                     if (!resp.ok) error(resp.error ?: "relay failed")
                     resp.tx ?: error("relay returned no tx")
                 } else throw t

@@ -3,11 +3,13 @@ import { v4 as uuidv4 } from "uuid";
 import { config } from "./config.js";
 
 /// Build the canonical OfflineVault voucher digest.
-/// MUST match OfflineVault.voucherDigest exactly.
+/// MUST match OfflineVault.voucherDigest exactly:
+///   (payer, merchant, recipient, amount, expiry, nonce, voucherId, chainId, vault)
+/// `recipient` is signed so relay broadcasters cannot redirect funds.
 export function voucherDigest(v) {
   const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
-    ["address","address","uint256","uint256","uint256","bytes32","uint256","address"],
-    [v.payer, v.merchant, v.amount, v.expiry, v.nonce, v.voucherId, config.chainId, config.vault]
+    ["address","address","address","uint256","uint256","uint256","bytes32","uint256","address"],
+    [v.payer, v.merchant, v.recipient, v.amount, v.expiry, v.nonce, v.voucherId, config.chainId, config.vault]
   );
   return ethers.keccak256(encoded);
 }
@@ -32,10 +34,14 @@ export function newVoucherId() {
 }
 
 /// Build a voucher object (without signature). amountUsdc is in base units (6 decimals).
-export function buildVoucher({ payer, merchant, amountUsdc, ttlSeconds, nonce }) {
+/// `recipient` is required for bearer vouchers (where merchant=0); the contract
+/// rejects recipient=0 on the bearer settle path. For legacy fixed-merchant
+/// flows pass recipient = merchant (or 0 — they're not used there).
+export function buildVoucher({ payer, merchant, recipient, amountUsdc, ttlSeconds, nonce }) {
   return {
     payer,
     merchant: merchant || ethers.ZeroAddress,
+    recipient: recipient || ethers.ZeroAddress,
     amount: BigInt(amountUsdc),
     expiry: BigInt(Math.floor(Date.now() / 1000) + (ttlSeconds || 24 * 3600)),
     nonce: BigInt(nonce),
@@ -43,30 +49,14 @@ export function buildVoucher({ payer, merchant, amountUsdc, ttlSeconds, nonce })
   };
 }
 
-/// Compact format for the ESP32 / MIFARE card. We can't fit full JSON with addresses
-/// on a 16-byte block, so the ESP32 stores a tiny base64-ish blob and the merchant
-/// app expands it (signature is the only big field — 65 bytes hex = 132 chars).
-///
-/// Layout written across 2 consecutive MIFARE blocks (32 bytes total) for short
-/// vouchers, but for safety we use 4 blocks (64 bytes) — enough for everything
-/// except the signature, which goes into the next 5 blocks. Total: 9 data blocks
-/// per voucher. With 5 vouchers/card and 16-byte blocks, this just barely fits.
-///
-/// Easier path: store the *voucherId* and *amount* on the card, plus a server-issued
-/// short opaque token, and have the merchant phone fetch the full signed voucher
-/// from a local cache once it sees the token. But for fully-offline we need it ALL
-/// on the card.
-///
-/// Compromise used here: the card stores a single short JSON like
-///   {"v":"1","i":"<uuid>","a":<amt>,"e":<exp>,"n":<n>,"p":"<payer>","s":"<sig>"}
-/// concatenated across 16 contiguous data blocks (256 bytes), more than enough.
-/// The reader firmware reassembles by reading until it hits a \0 byte.
+/// Compact JSON for the NFC wire / QR code. Matches Voucher.kt CardVoucherPayload.
 export function voucherToCardJson(v, signature) {
   return JSON.stringify({
-    v: 1,
+    v: 2,                      // bumped: schema includes recipient
     i: v.voucherId,
     p: v.payer,
     m: v.merchant,
+    r: v.recipient,
     a: v.amount.toString(),
     e: Number(v.expiry),
     n: Number(v.nonce),
@@ -80,6 +70,7 @@ export function voucherFromCardJson(json) {
     voucher: {
       payer: o.p,
       merchant: o.m,
+      recipient: o.r,
       amount: BigInt(o.a),
       expiry: BigInt(o.e),
       nonce: BigInt(o.n),

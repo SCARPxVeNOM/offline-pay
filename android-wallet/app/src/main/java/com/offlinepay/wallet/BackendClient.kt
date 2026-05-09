@@ -41,7 +41,8 @@ class BackendClient(initialBaseUrl: String = Config.BACKEND_BASE) {
         val count: Int? = null,
     )
     @Serializable data class VoucherFields(
-        val payer: String, val merchant: String, val amount: String,
+        val payer: String, val merchant: String, val recipient: String,
+        val amount: String,
         val expiry: Long, val nonce: Long, val voucherId: String
     )
     @Serializable data class IssuedVoucher(
@@ -58,7 +59,9 @@ class BackendClient(initialBaseUrl: String = Config.BACKEND_BASE) {
     )
 
     @Serializable data class RedeemItem(val voucher: VoucherFields, val signature: String)
-    @Serializable data class RedeemReq(val recipient: String, val vouchers: List<RedeemItem>)
+    /// recipient is now embedded in each voucher's signed digest, so the
+    /// redeem request body just needs the voucher list.
+    @Serializable data class RedeemReq(val vouchers: List<RedeemItem>)
     @Serializable data class Reject(val voucherId: String, val reason: String)
     @Serializable data class RedeemResp(
         val ok: Boolean = false,
@@ -98,11 +101,11 @@ class BackendClient(initialBaseUrl: String = Config.BACKEND_BASE) {
             json.decodeFromString(TopupResp.serializer(), text)
         }
 
-    suspend fun redeem(recipient: String, items: List<RedeemItem>): RedeemResp =
+    suspend fun redeem(items: List<RedeemItem>): RedeemResp =
         withContext(Dispatchers.IO) {
             val body = json.encodeToString(
                 RedeemReq.serializer(),
-                RedeemReq(recipient, items)
+                RedeemReq(items)
             )
             val r = http.newCall(
                 Request.Builder().url("$baseUrl/api/wallet/redeem")
