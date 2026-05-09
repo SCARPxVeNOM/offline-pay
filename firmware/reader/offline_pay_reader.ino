@@ -350,8 +350,11 @@ void pumpBtCommands() {
       }
     } else {
       btLineBuf += c;
-      if (btLineBuf.length() > 600) {
-        // Pathological input — drop and resync.
+      if (btLineBuf.length() > 1500) {
+        // Pathological input — drop and resync. Threshold is sized
+        // so a legitimate WRITE line ("WRITE <addr> <pubkey> <sig>
+        // <json>" ≈ 700 bytes) still fits with margin for future
+        // schema growth.
         Serial.println("[BT] line buffer overflow, dropping");
         btLineBuf = "";
       }
