@@ -36,13 +36,15 @@ static bool    s_ready = false;
 // ------------------------- helpers -------------------------------------------
 
 static String toHex(const uint8_t* bytes, size_t len, bool with0x) {
-  static const char* HEX = "0123456789abcdef";
+  // NOTE: Arduino.h #defines HEX as 16. Local name must avoid that
+  // macro collision, hence "kHex".
+  static const char* kHex = "0123456789abcdef";
   String out;
   out.reserve((with0x ? 2 : 0) + len * 2);
   if (with0x) out += "0x";
   for (size_t i = 0; i < len; i++) {
-    out += HEX[bytes[i] >> 4];
-    out += HEX[bytes[i] & 0x0f];
+    out += kHex[bytes[i] >> 4];
+    out += kHex[bytes[i] & 0x0f];
   }
   return out;
 }
@@ -61,8 +63,11 @@ static bool keccak256(const uint8_t* data, size_t len, uint8_t out32[32]) {
     0x8000000000008002ULL,0x8000000000000080ULL,0x000000000000800aULL,0x800000008000000aULL,
     0x8000000080008081ULL,0x8000000000008080ULL,0x0000000080000001ULL,0x8000000080008008ULL,
   };
+  // Arduino.h #defines PI as a math constant; local table must use a
+  // different name to avoid macro substitution. KECCAK_PI matches the
+  // standard Keccak naming.
   static const int RHO[24] = {1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44};
-  static const int PI [24] = {10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
+  static const int KECCAK_PI [24] = {10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
   uint64_t st[25] = {0};
   const size_t rate = 136; // 1088 bits → bytes
   uint8_t buf[200] = {0};
@@ -84,7 +89,7 @@ static bool keccak256(const uint8_t* data, size_t len, uint8_t out32[32]) {
       }
       t = st[1];
       for (int i = 0; i < 24; i++) {
-        int j = PI[i];
+        int j = KECCAK_PI[i];
         bc[0] = st[j];
         st[j] = (t << RHO[i]) | (t >> (64 - RHO[i]));
         t = bc[0];
