@@ -292,6 +292,12 @@ String readVoucher() {
   for (uint8_t i = 0; i < VOUCHER_BLOCK_COUNT; i++) {
     uint8_t block = VOUCHER_BLOCKS[i];
 
+    // Pump BT between blocks. Each MIFARE auth+read takes ~5-10ms;
+    // 21 blocks = ~150-200ms of blocking SPI work. Without pumping
+    // here the ESP32's 1024-byte BT RX buffer overflows when the
+    // phone tries to send a WRITE (627 bytes) during the read.
+    pumpBtCommands();
+
     if (!authBlock(block)) {
       Serial.println(String("[CARD] auth failed @ block ") + block);
       return "";
@@ -301,6 +307,14 @@ String readVoucher() {
     if (rfid.MIFARE_Read(block, buffer, &bufferSize) != MFRC522::STATUS_OK) {
       Serial.println(String("[CARD] read failed @ block ") + block);
       return "";
+    }
+
+    // Fast-path: if the very first block starts with "USED" the card
+    // is the known-empty sentinel — bail immediately so we don't waste
+    // 200ms reading 21 blocks of "USED____________".
+    if (i == 0 && buffer[0] == 'U' && buffer[1] == 'S' &&
+        buffer[2] == 'E' && buffer[3] == 'D') {
+      return "USED";
     }
 
     for (uint8_t j = 0; j < 16; j++) {
