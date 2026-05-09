@@ -39,4 +39,34 @@ String signEthMessage(const uint8_t* digest, size_t len);
 // the corresponding device address has been revoked on-chain.
 void wipe();
 
+// Verify an EIP-191 personal_sign signature against a 65-byte uncompressed
+// public key (`pub65 = 0x04 || X || Y`). The 32-byte digest passed in is the
+// raw payload — this function applies the EIP-191 prefix internally to match
+// what the phone signs with `Sign.signPrefixedMessage`.
+//
+// `payload` is the application-level bytes (e.g. "OFFPAY-CLAIM-V1" || espId ||
+// nonce) — typically NOT 32 bytes itself, so we sign the keccak256 of the
+// EIP-191-wrapped bytes.
+//
+// Returns true iff the signature is valid AND the address derived from
+// `pub65` (last 20 bytes of keccak256(pub65[1..])) equals `expectedAddr20`.
+bool verifyEthPersonalSig(
+    const uint8_t* payload, size_t payloadLen,
+    const uint8_t pub65[65],
+    const uint8_t r[32], const uint8_t s[32],
+    const uint8_t expectedAddr20[20]);
+
+// Compute the 20-byte EVM address from an uncompressed pubkey.
+void addressFromPubkey(const uint8_t pub65[65], uint8_t out20[20]);
+
+// Persist the bonded owner address (the phone wallet that successfully
+// completed CLAIM). Returns true on success.
+bool setOwner(const uint8_t addr20[20]);
+bool getOwner(uint8_t addr20[20]);
+bool hasOwner();
+void clearOwner();
+
+// Returns the owner address as a 0x… string, or "0x0000…" when unset.
+String ownerAddressHex();
+
 } // namespace OfflinePayWallet

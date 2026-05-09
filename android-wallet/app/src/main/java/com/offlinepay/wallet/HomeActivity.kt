@@ -39,6 +39,8 @@ class HomeActivity : ComponentActivity() {
     private lateinit var backend: BackendClient
     private lateinit var activity: ActivityStore
     private lateinit var settle: SettlementClient
+    private lateinit var balanceCache: BalanceCache
+    private lateinit var espBondStore: EspBondStore
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     private val state = MutableStateFlow(DashState())
@@ -58,6 +60,8 @@ class HomeActivity : ComponentActivity() {
             chainId = Config.CHAIN_ID, keyPair = keyVault.keyPair,
             fromAddress = keyVault.address
         )
+        balanceCache = BalanceCache(this)
+        espBondStore = EspBondStore(this)
 
         state.value = state.value.copy(walletAddress = keyVault.address)
 
@@ -76,14 +80,19 @@ class HomeActivity : ComponentActivity() {
                         startActivity(Intent(Intent.ACTION_VIEW,
                             android.net.Uri.parse(Config.addressUrl(keyVault.address))))
                     },
+                    onEsp = { startActivity(Intent(this, EspActivity::class.java)) },
                 )
             }
         }
 
         // Live unified activity feed: topup + sent + received + settled.
+        // Also re-render the balance card on every change so the moment
+        // the user signs a voucher (sent row inserted) the spendable
+        // figure drops, even with no internet.
         lifecycleScope.launch {
             activity.recent().collect { rows ->
                 state.value = state.value.copy(recent = rows.take(20).map { it.toRecentRow() })
+                renderBalance()
             }
         }
         // Pending-receive count comes from the voucher store separately.
@@ -140,9 +149,36 @@ class HomeActivity : ComponentActivity() {
         }
         // Toast on every observable mesh transition. The user can SEE the
         // relay path firing on each phone — no more "is mesh even running?"
-        // guessing.
+        // guessing. Also: when a peer tells us a voucher settled, drop it
+        // from in-flight and re-render — spendable rises instantly even
+        // if we still have no internet ourselves.
         lifecycleScope.launch {
-            WalletMesh.events.collect { ev -> showMeshToast(ev) }
+            WalletMesh.events.collect { ev ->
+                showMeshToast(ev)
+                if (ev is MeshEvent.SettledByPeer) {
+                    balanceCache.markSettled(ev.voucherId)
+                    renderBalance()
+                }
+            }
+        }
+        // Periodic re-render so "synced 32s ago" keeps ticking. Cheap —
+        // renderBalance only touches a SharedPreferences read and 50
+        // ledger rows, no chain RPC.
+        lifecycleScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(30_000)
+                renderBalance()
+            }
+        }
+        // ESP bond → Dash state. Reflects pairing in real time so the
+        // Reader pill on Home updates the moment EspActivity returns.
+        lifecycleScope.launch {
+            espBondStore.stateFlow.collect { bond ->
+                state.value = state.value.copy(
+                    espPairedAddress = bond.espAddress,
+                    espLastSeenMs    = bond.lastSeenMs,
+                )
+            }
         }
     }
 
@@ -172,18 +208,19 @@ class HomeActivity : ComponentActivity() {
         if (isOnline()) homeScope.launch { autoSettle() }
     }
 
-    /// Pulls chain truth: lockedBalance(self) + which sent voucherIds are
-    /// already settled. Computes a spendable = locked - in-flight (sent
-    /// vouchers not yet seen as `usedVouchers`). Updates UI atomically so
-    /// numbers don't race.
+    /// Pulls chain truth and rolls it into the cache. Online-only. After
+    /// success, every renderBalance() call (which is on every send,
+    /// receive, mesh `settled`, and screen resume) will see fresh
+    /// numbers without another RPC. On failure or no internet, we just
+    /// fall through to the cached values — UI stays live.
     private fun refreshChainBalance() {
-        if (!isOnline()) {
-            state.value = state.value.copy(syncedSecondsAgo = null)
-            return
-        }
+        renderBalance()
+        if (!isOnline()) return
         homeScope.launch {
             runCatching {
                 val locked = settle.lockedBalance(keyVault.address)
+                balanceCache.lockedBalance = locked
+                balanceCache.lastSyncedMs = System.currentTimeMillis()
                 // Look up sent voucherIds we've recorded but never confirmed
                 // as settled. Limit to the most recent 50 so we don't blast
                 // the RPC for old, almost-certainly-settled entries.
@@ -193,18 +230,36 @@ class HomeActivity : ComponentActivity() {
                 }.take(50)
                 val ids = sentVouchers.mapNotNull { it.voucherId }
                 val usedMap = if (ids.isNotEmpty()) settle.usedVouchers(ids) else emptyMap()
-                val inFlight = sentVouchers
-                    .filter { usedMap[it.voucherId] != true }
-                    .sumOf { it.amountBaseUnits }
-                val lockedLong = locked.toLong()
-                val spendableLong = (lockedLong - inFlight).coerceAtLeast(0L)
-                state.value = state.value.copy(
-                    lockedUsdc    = "%.2f".format(lockedLong / 1e6),
-                    inFlightUsdc  = "%.2f".format(inFlight / 1e6),
-                    spendableUsdc = "%.2f".format(spendableLong / 1e6),
-                    syncedSecondsAgo = 0,
-                )
+                balanceCache.markAllSettled(usedMap.filterValues { it == true }.keys)
+                renderBalance()
             }.onFailure { Log.w(TAG, "balance refresh failed: ${it.message}") }
+        }
+    }
+
+    /// Synchronous, offline-safe balance compute. Reads cached locked
+    /// balance + the activity ledger; subtracts in-flight (sent vouchers
+    /// not yet known-settled, where "known" = chain OR mesh). Cheap
+    /// enough to call on every flow tick — no chain access.
+    private fun renderBalance() {
+        homeScope.launch {
+            val locked = balanceCache.lockedBalance
+            val sentRows = VoucherDb.get(this@HomeActivity).activityDao().recentList()
+            val sentVouchers = sentRows.filter { it.kind == "sent" && it.voucherId != null }.take(50)
+            val inFlight = sentVouchers
+                .filter { !balanceCache.isSettled(it.voucherId!!) }
+                .sumOf { it.amountBaseUnits }
+            val lockedLong = locked.toLong()
+            val spendableLong = (lockedLong - inFlight).coerceAtLeast(0L)
+            val syncedAgo = balanceCache.lastSyncedMs.let { ts ->
+                if (ts == 0L) null
+                else ((System.currentTimeMillis() - ts) / 1000).toInt().coerceAtLeast(0)
+            }
+            state.value = state.value.copy(
+                lockedUsdc    = "%.2f".format(lockedLong / 1e6),
+                inFlightUsdc  = "%.2f".format(inFlight / 1e6),
+                spendableUsdc = "%.2f".format(spendableLong / 1e6),
+                syncedSecondsAgo = syncedAgo,
+            )
         }
     }
 
@@ -347,8 +402,13 @@ class HomeActivity : ComponentActivity() {
                 // accepted row of our own (we'd just echo to ourselves
                 // which the dedup set drops).
                 WalletMesh.broadcastSettled(it.voucherId, tx)
+                // Also drop these from our local in-flight set so the
+                // spendable figure updates without waiting for the next
+                // chain refresh.
+                balanceCache.markSettled(it.voucherId)
             }
             activity.recordSettled(pending.map { it.voucherId }, tx)
+            renderBalance()
             state.value = state.value.copy(settleStatus = "⛓ settled ${pending.size} — tx ${tx.take(10)}…")
             // Refresh balances now that chain state changed.
             refreshChainBalance()

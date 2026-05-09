@@ -296,6 +296,14 @@ app.post("/api/wallet/init", async (req, res) => {
       const gasFloor = ethers.parseEther("0.10");
       const gasTopup = ethers.parseEther("0.20");
       const balance  = await provider.getBalance(address);
+      // Bump fee 2x over network so we don't get parked at the back of
+      // Amoy's mempool when the testnet is busy. EIP-1559 fields beat
+      // legacy gasPrice for Polygon. Floor at 50 gwei to be safe.
+      const fee = await provider.getFeeData();
+      const tipMin = ethers.parseUnits("50", "gwei");
+      const tip   = (fee.maxPriorityFeePerGas ?? tipMin) * 2n;
+      const max   = ((fee.maxFeePerGas ?? tipMin) * 2n) + tip;
+      const txOpts = { maxPriorityFeePerGas: tip, maxFeePerGas: max };
       // Submit sequentially — Promise.all races nonces in NonceManager and
       // Infura intermittently rejects with "nonce too low" when the second
       // tx beats the first into the mempool. Submit fire-and-forget then
@@ -303,17 +311,18 @@ app.post("/api/wallet/init", async (req, res) => {
       const txList = [];
       if (balance < gasFloor) {
         const need = gasTopup - balance;
-        const t = await signer.sendTransaction({ to: address, value: need });
+        const t = await signer.sendTransaction({ to: address, value: need, ...txOpts });
         txList.push({ key: 'gas', tx: t });
       }
       if (amt > 0n) {
-        const t = await usdc.mint(address, amt);
+        const t = await usdc.mint(address, amt, txOpts);
         txList.push({ key: 'mint', tx: t });
       }
-      // Wait for all in parallel — both already broadcast. 60s timeout so a
-      // tx that never mines (e.g. Amoy congestion) doesn't wedge the global
-      // chain-op queue and lock out every subsequent /init for everyone.
-      await Promise.all(txList.map(it => it.tx.wait(1, 60_000)));
+      // Wait in parallel. 240s ceiling: long enough that Amoy congestion
+      // doesn't rip a still-pending tx out from under us, short enough
+      // that a genuinely dead tx doesn't wedge the global chain-op queue
+      // and lock out every subsequent /init.
+      await Promise.all(txList.map(it => it.tx.wait(1, 240_000)));
       for (const it of txList) txs[it.key] = it.tx.hash;
       return txs;
     });

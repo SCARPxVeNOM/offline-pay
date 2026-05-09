@@ -26,6 +26,7 @@ namespace OfflinePayWallet {
 
 static constexpr const char* NVS_NAMESPACE = "opwallet";
 static constexpr const char* NVS_PRIV_KEY  = "priv";
+static constexpr const char* NVS_OWNER     = "owner";   // 20-byte EVM addr
 
 static uint8_t s_priv[32];          // private scalar
 static uint8_t s_pub[65];           // 0x04 || X(32) || Y(32)
@@ -267,12 +268,131 @@ void wipe() {
   Preferences prefs;
   if (prefs.begin(NVS_NAMESPACE, false)) {
     prefs.remove(NVS_PRIV_KEY);
+    prefs.remove(NVS_OWNER);
     prefs.end();
   }
   memset(s_priv, 0, sizeof(s_priv));
   memset(s_pub, 0, sizeof(s_pub));
   memset(s_address, 0, sizeof(s_address));
   s_ready = false;
+}
+
+// ---------------- pubkey → address ------------------------------------------
+
+void addressFromPubkey(const uint8_t pub65[65], uint8_t out20[20]) {
+  // Same scheme as our own setup: keccak256 of the 64-byte X||Y, last 20 bytes.
+  uint8_t hash[32];
+  keccak256(pub65 + 1, 64, hash);
+  memcpy(out20, hash + 12, 20);
+}
+
+// ---------------- ECDSA verify (EIP-191) ------------------------------------
+
+bool verifyEthPersonalSig(
+    const uint8_t* payload, size_t payloadLen,
+    const uint8_t pub65[65],
+    const uint8_t r[32], const uint8_t s[32],
+    const uint8_t expectedAddr20[20]) {
+
+  // 1. EIP-191 prefix. The digest the signer hashed is:
+  //    keccak256("\x19Ethereum Signed Message:\n" + decimal(len) + payload)
+  // We support payloadLen up to 999 here — plenty for a CLAIM frame.
+  if (payloadLen == 0 || payloadLen > 999) return false;
+  char lenBuf[8];
+  int lenStrLen = snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned)payloadLen);
+  if (lenStrLen <= 0) return false;
+
+  static const char prefix[] = "\x19" "Ethereum Signed Message:\n";
+  size_t prefixLen = sizeof(prefix) - 1; // 26
+  size_t total = prefixLen + (size_t)lenStrLen + payloadLen;
+  if (total > 1024) return false; // sanity
+
+  uint8_t* buf = (uint8_t*) malloc(total);
+  if (!buf) return false;
+  memcpy(buf, prefix, prefixLen);
+  memcpy(buf + prefixLen, lenBuf, lenStrLen);
+  memcpy(buf + prefixLen + lenStrLen, payload, payloadLen);
+
+  uint8_t hash[32];
+  keccak256(buf, total, hash);
+  free(buf);
+
+  // 2. Address consistency check — fail fast before doing the ECP work.
+  uint8_t derivedAddr[20];
+  addressFromPubkey(pub65, derivedAddr);
+  if (memcmp(derivedAddr, expectedAddr20, 20) != 0) return false;
+
+  // 3. ECDSA verify with mbedtls. We feed the X/Y of pub65 as a point on
+  //    secp256k1, plus the (r, s) signature.
+  mbedtls_ecp_group grp;
+  mbedtls_ecp_point Q;
+  mbedtls_mpi rr, ss;
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_ecp_point_init(&Q);
+  mbedtls_mpi_init(&rr);
+  mbedtls_mpi_init(&ss);
+
+  bool ok = false;
+  do {
+    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256K1) != 0) break;
+    if (mbedtls_mpi_read_binary(&Q.X, pub65 + 1, 32) != 0) break;
+    if (mbedtls_mpi_read_binary(&Q.Y, pub65 + 33, 32) != 0) break;
+    if (mbedtls_mpi_lset(&Q.Z, 1) != 0) break;
+    // Sanity: confirm the point is actually on-curve. mbedtls_ecdsa_verify
+    // does this internally too but checking up front gives us a clean error.
+    if (mbedtls_ecp_check_pubkey(&grp, &Q) != 0) break;
+    if (mbedtls_mpi_read_binary(&rr, r, 32) != 0) break;
+    if (mbedtls_mpi_read_binary(&ss, s, 32) != 0) break;
+    int rc = mbedtls_ecdsa_verify(&grp, hash, 32, &Q, &rr, &ss);
+    ok = (rc == 0);
+  } while (0);
+
+  mbedtls_mpi_free(&ss);
+  mbedtls_mpi_free(&rr);
+  mbedtls_ecp_point_free(&Q);
+  mbedtls_ecp_group_free(&grp);
+  return ok;
+}
+
+// ---------------- owner persistence -----------------------------------------
+
+bool setOwner(const uint8_t addr20[20]) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) return false;
+  size_t n = prefs.putBytes(NVS_OWNER, addr20, 20);
+  prefs.end();
+  return n == 20;
+}
+
+bool getOwner(uint8_t addr20[20]) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) return false;
+  size_t got = prefs.getBytesLength(NVS_OWNER);
+  if (got != 20) { prefs.end(); return false; }
+  prefs.getBytes(NVS_OWNER, addr20, 20);
+  prefs.end();
+  return true;
+}
+
+bool hasOwner() {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) return false;
+  bool ok = (prefs.getBytesLength(NVS_OWNER) == 20);
+  prefs.end();
+  return ok;
+}
+
+void clearOwner() {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) return;
+  prefs.remove(NVS_OWNER);
+  prefs.end();
+}
+
+String ownerAddressHex() {
+  uint8_t a[20];
+  if (!getOwner(a)) return String("0x0000000000000000000000000000000000000000");
+  return toHex(a, 20, true);
 }
 
 } // namespace OfflinePayWallet

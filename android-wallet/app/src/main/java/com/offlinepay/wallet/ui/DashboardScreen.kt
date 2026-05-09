@@ -39,6 +39,11 @@ data class DashState(
     val settleStatus: String? = null,
     val recent: List<RecentRow> = emptyList(),
     val meshPeerCount: Int = 0,
+    /// Address of the currently-paired ESP32 reader, if any. Drives the
+    /// "Reader" pill on Home so the user sees state without opening the
+    /// control center every time.
+    val espPairedAddress: String? = null,
+    val espLastSeenMs: Long? = null,
 )
 
 data class RecentRow(
@@ -60,6 +65,7 @@ fun DashboardScreen(
     onBackup: () -> Unit,
     onSettleNow: () -> Unit,
     onAddressClick: () -> Unit = {},
+    onEsp: () -> Unit = {},
 ) {
     Box(
         Modifier
@@ -99,6 +105,11 @@ fun DashboardScreen(
             if (state.settleStatus != null) SettleBanner(state.settleStatus, onSettleNow)
             if (state.pendingCount > 0) PendingBanner(state.pendingCount, state.pendingUsdc, onSettleNow)
             MeshStatusBanner(state.meshPeerCount)
+            EspPill(
+                pairedAddress = state.espPairedAddress,
+                lastSeenMs = state.espLastSeenMs,
+                onClick = onEsp,
+            )
             SectionHeader("Quick actions", "View all ›")
             QuickActions(onTopup = onTopup, onBackup = onBackup, onHistory = onHistory)
             SectionHeader("Recent activity", "See all ›")
@@ -485,6 +496,50 @@ private fun PendingBanner(count: Int, totalUsdc: String, onSettleNow: () -> Unit
             }
             Icon(Icons.Outlined.ChevronRight, null, tint = OffpayColors.TealDeep)
         }
+    }
+}
+
+@Composable
+private fun EspPill(pairedAddress: String?, lastSeenMs: Long?, onClick: () -> Unit) {
+    val (label, sub) = when {
+        pairedAddress == null -> "Reader: not paired" to "TAP TO CONNECT AN ESP32"
+        lastSeenMs != null    -> "Reader paired" to "ESP32 ${shortAddr(pairedAddress)} · ${relativeMs(lastSeenMs)}"
+        else                  -> "Reader paired" to "ESP32 ${shortAddr(pairedAddress)}"
+    }
+    Box(
+        Modifier
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (pairedAddress != null) OffpayColors.TealSoft else OffpayColors.OffWhite)
+            .border(1.dp, OffpayColors.Hairline, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(Icons.Outlined.Sensors, null, tint = OffpayColors.TealDeep, modifier = Modifier.size(16.dp))
+            Column(Modifier.weight(1f)) {
+                Text(label, color = OffpayColors.Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                MonoLabel(sub)
+            }
+            Icon(Icons.Outlined.ChevronRight, null, tint = OffpayColors.InkSoft)
+        }
+    }
+}
+
+private fun shortAddr(addr: String?): String =
+    if (addr == null) "—" else addr.take(8) + "…" + addr.takeLast(6)
+
+private fun relativeMs(ms: Long): String {
+    val s = (System.currentTimeMillis() - ms) / 1000
+    return when {
+        s < 60     -> "JUST NOW"
+        s < 3600   -> "${s / 60}M AGO"
+        s < 86400  -> "${s / 3600}H AGO"
+        else       -> "${s / 86400}D AGO"
     }
 }
 
