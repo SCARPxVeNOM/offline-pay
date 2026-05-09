@@ -44,6 +44,37 @@ object EspWriteClient {
         voucherJson: String,
         keyVault: KeyVault,
     ): Result = withContext(Dispatchers.IO) {
+        // BT classic SPP to ESP32 BluetoothSerial is flaky — the link
+        // can drop in 5-10 seconds if the firmware happens to be in a
+        // card-read loop when we try to connect. Retry the whole
+        // handshake up to 3 times with a small delay; this turns
+        // sporadic socket-closed failures into a single write.
+        var lastFailure: Result.Failed? = null
+        repeat(3) { attempt ->
+            if (attempt > 0) {
+                Log.w(TAG, "retrying write (attempt ${attempt + 1}/3) after ${lastFailure?.reason}")
+                kotlinx.coroutines.delay(1500)
+            }
+            when (val r = attemptWriteOnce(bondedBtMac, voucherJson, keyVault)) {
+                is Result.Written -> return@withContext r
+                is Result.Failed  -> {
+                    val transient = r.reason.contains("socket closed", ignoreCase = true) ||
+                                    r.reason.contains("read return", ignoreCase = true) ||
+                                    r.reason.contains("timeout", ignoreCase = true) ||
+                                    r.reason.contains("read failed", ignoreCase = true)
+                    if (!transient) return@withContext r
+                    lastFailure = r
+                }
+            }
+        }
+        lastFailure ?: Result.Failed("write failed after 3 attempts")
+    }
+
+    private suspend fun attemptWriteOnce(
+        bondedBtMac: String,
+        voucherJson: String,
+        keyVault: KeyVault,
+    ): Result = withContext(Dispatchers.IO) {
         val adapter = BluetoothAdapter.getDefaultAdapter()
             ?: return@withContext Result.Failed("no Bluetooth adapter")
         @Suppress("MissingPermission")
