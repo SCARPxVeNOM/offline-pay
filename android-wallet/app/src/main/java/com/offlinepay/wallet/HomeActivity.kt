@@ -143,17 +143,47 @@ class HomeActivity : ComponentActivity() {
         mesh.start()
         ensureMeshPermissions()
         registerNetCallback()
-        if (isOnline()) {
-            homeScope.launch {
-                runCatching {
-                    val locked = settle.lockedBalance(keyVault.address)
-                    val str = "%.2f".format(locked.toDouble() / 1e6)
-                    state.value = state.value.copy(lockedUsdc = str, syncedSecondsAgo = 0)
-                }
-                autoSettle()
-            }
-        } else {
+        refreshChainBalance()
+        autoSettleIfOnline()
+    }
+
+    private fun autoSettleIfOnline() {
+        if (isOnline()) homeScope.launch { autoSettle() }
+    }
+
+    /// Pulls chain truth: lockedBalance(self) + which sent voucherIds are
+    /// already settled. Computes a spendable = locked - in-flight (sent
+    /// vouchers not yet seen as `usedVouchers`). Updates UI atomically so
+    /// numbers don't race.
+    private fun refreshChainBalance() {
+        if (!isOnline()) {
             state.value = state.value.copy(syncedSecondsAgo = null)
+            return
+        }
+        homeScope.launch {
+            runCatching {
+                val locked = settle.lockedBalance(keyVault.address)
+                // Look up sent voucherIds we've recorded but never confirmed
+                // as settled. Limit to the most recent 50 so we don't blast
+                // the RPC for old, almost-certainly-settled entries.
+                val sentRows = VoucherDb.get(this@HomeActivity).activityDao().recentList()
+                val sentVouchers = sentRows.filter {
+                    it.kind == "sent" && it.voucherId != null
+                }.take(50)
+                val ids = sentVouchers.mapNotNull { it.voucherId }
+                val usedMap = if (ids.isNotEmpty()) settle.usedVouchers(ids) else emptyMap()
+                val inFlight = sentVouchers
+                    .filter { usedMap[it.voucherId] != true }
+                    .sumOf { it.amountBaseUnits }
+                val lockedLong = locked.toLong()
+                val spendableLong = (lockedLong - inFlight).coerceAtLeast(0L)
+                state.value = state.value.copy(
+                    lockedUsdc    = "%.2f".format(lockedLong / 1e6),
+                    inFlightUsdc  = "%.2f".format(inFlight / 1e6),
+                    spendableUsdc = "%.2f".format(spendableLong / 1e6),
+                    syncedSecondsAgo = 0,
+                )
+            }.onFailure { Log.w(TAG, "balance refresh failed: ${it.message}") }
         }
     }
 
@@ -246,6 +276,8 @@ class HomeActivity : ComponentActivity() {
             pending.forEach { received.markSettled(it.voucherId, tx) }
             activity.recordSettled(pending.map { it.voucherId }, tx)
             state.value = state.value.copy(settleStatus = "⛓ settled ${pending.size} — tx ${tx.take(10)}…")
+            // Refresh balances now that chain state changed.
+            refreshChainBalance()
         } catch (t: Throwable) {
             Log.e(TAG, "settle failed", t)
             // Mark the offending voucher rejected so we don't keep retrying.
@@ -320,14 +352,19 @@ private fun ActivityRow.toRecentRow(): RecentRow {
             sub = "TAPPED · $ts",
             amountSigned = "− \$$amt",
             incoming = false,
-            explorerUrl = null,  // sender doesn't broadcast; receiver does.
+            // Sender doesn't broadcast a tx — receiver does. Link to the
+            // receiver's address page; their incoming USDC transfers show
+            // up there once they settle.
+            explorerUrl = counterparty?.let { Config.addressUrl(it) },
         )
         "received" -> RecentRow(
             title = "Received from ${short ?: "—"}",
             sub = "TAPPED · $ts",
             amountSigned = "+ \$$amt",
             incoming = true,
-            explorerUrl = null,
+            // Voucher arrived offline — link to the sender's address page so
+            // user can see who paid them.
+            explorerUrl = counterparty?.let { Config.addressUrl(it) },
         )
         "settled"  -> RecentRow(
             title = note ?: "Settled on chain",

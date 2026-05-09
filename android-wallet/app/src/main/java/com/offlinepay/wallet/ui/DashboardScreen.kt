@@ -30,8 +30,10 @@ import com.offlinepay.wallet.R
 
 data class DashState(
     val walletAddress: String = "0x000…0000",
-    val lockedUsdc: String = "0.00",
-    val pendingCount: Int = 0,
+    val lockedUsdc: String = "0.00",       // chain truth — total still locked
+    val spendableUsdc: String = "0.00",    // = lockedUsdc - inFlightUsdc
+    val inFlightUsdc: String = "0.00",     // sent but receiver not settled yet
+    val pendingCount: Int = 0,             // received but waiting for settle
     val pendingUsdc: String = "0.00",
     val syncedSecondsAgo: Int? = null,
     val settleStatus: String? = null,
@@ -87,7 +89,9 @@ fun DashboardScreen(
             DashHeader(walletShort = state.walletAddress.short(), onClick = onAddressClick)
             ConnectWalletPill(walletAddress = state.walletAddress, onClick = onBackup)
             BalanceCard(
+                spendableUsdc = state.spendableUsdc,
                 lockedUsdc = state.lockedUsdc,
+                inFlightUsdc = state.inFlightUsdc,
                 syncedSecondsAgo = state.syncedSecondsAgo,
                 onTopup = onTopup
             )
@@ -223,8 +227,33 @@ private fun ConnectWalletPill(walletAddress: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun BalanceCard(lockedUsdc: String, syncedSecondsAgo: Int?, onTopup: () -> Unit) {
-    val (whole, dec) = lockedUsdc.split(".", limit = 2).let {
+private fun BalanceChip(label: String, value: String, accent: Color = Color.White.copy(alpha = 0.65f)) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.White.copy(alpha = 0.08f))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(label, color = accent,
+                fontFamily = MonoFamily, fontSize = 8.5.sp,
+                letterSpacing = 1.4.sp, fontWeight = FontWeight.SemiBold)
+            Text(value, color = Color.White, fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun BalanceCard(
+    spendableUsdc: String,
+    lockedUsdc: String,
+    inFlightUsdc: String,
+    syncedSecondsAgo: Int?,
+    onTopup: () -> Unit,
+) {
+    val (whole, dec) = spendableUsdc.split(".", limit = 2).let {
         (it.getOrNull(0) ?: "0") to (it.getOrNull(1) ?: "00").padEnd(2, '0').take(2)
     }
     Box(
@@ -254,7 +283,7 @@ private fun BalanceCard(lockedUsdc: String, syncedSecondsAgo: Int?, onTopup: () 
                     Icon(Icons.Outlined.Visibility, null,
                         tint = Color.White.copy(alpha = 0.7f),
                         modifier = Modifier.size(16.dp))
-                    Text("LOCKED BALANCE",
+                    Text("SPENDABLE",
                         color = Color.White.copy(alpha = 0.7f),
                         fontFamily = MonoFamily, fontSize = 10.sp,
                         letterSpacing = 2.sp, fontWeight = FontWeight.Medium)
@@ -279,6 +308,15 @@ private fun BalanceCard(lockedUsdc: String, syncedSecondsAgo: Int?, onTopup: () 
                 Text(".$dec", color = Color.White.copy(alpha = 0.7f),
                     fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(bottom = 4.dp))
+            }
+            // Breakdown chips: chain-truth + in-flight count.
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()) {
+                BalanceChip(label = "ON CHAIN", value = "\$$lockedUsdc")
+                if (inFlightUsdc != "0.00")
+                    BalanceChip(label = "IN FLIGHT", value = "\$$inFlightUsdc",
+                        accent = OffpayColors.Teal)
             }
             Row(verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,

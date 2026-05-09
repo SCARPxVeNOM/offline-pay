@@ -107,6 +107,9 @@ interface ActivityDao {
     @Query("SELECT * FROM activity ORDER BY ts DESC LIMIT 200")
     fun recent(): Flow<List<ActivityRow>>
 
+    @Query("SELECT * FROM activity ORDER BY ts DESC LIMIT 200")
+    suspend fun recentList(): List<ActivityRow>
+
     @Query("UPDATE activity SET txHash=:tx WHERE id=:id")
     suspend fun setTx(id: Long, tx: String)
 }

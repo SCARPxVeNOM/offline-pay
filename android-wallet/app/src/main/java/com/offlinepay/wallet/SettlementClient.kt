@@ -155,6 +155,31 @@ class SettlementClient(
     private suspend fun lockedBalanceFor(payer: String): BigInteger =
         lockedBalance(payer)
 
+    /// Bulk-check `usedVouchers[voucherId]` for several voucherIds. Used by
+    /// the sender side to figure out which in-flight vouchers have settled
+    /// (and thus their lockedBalance has decremented).
+    suspend fun usedVouchers(ids: List<String>): Map<String, Boolean> =
+        withContext(Dispatchers.IO) {
+            ids.associateWith { id ->
+                runCatching {
+                    val function = Function(
+                        "usedVouchers",
+                        listOf(Bytes32(Numeric.hexStringToByteArray(id))),
+                        listOf<TypeReference<*>>(object : TypeReference<org.web3j.abi.datatypes.Bool>() {})
+                    )
+                    val data = FunctionEncoder.encode(function)
+                    val resp = web3.ethCall(
+                        org.web3j.protocol.core.methods.request.Transaction.createEthCallTransaction(
+                            fromAddress, vaultAddress, data
+                        ),
+                        org.web3j.protocol.core.DefaultBlockParameterName.LATEST
+                    ).send()
+                    if (resp.hasError()) false
+                    else BigInteger(resp.value.removePrefix("0x").ifEmpty { "0" }, 16) != BigInteger.ZERO
+                }.getOrDefault(false)
+            }
+        }
+
     suspend fun lockedBalance(addr: String): BigInteger = withContext(Dispatchers.IO) {
         val function = Function(
             "lockedBalance",

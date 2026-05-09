@@ -100,7 +100,11 @@ private fun HistoryRow(r: ActivityRow) {
         "failed"   -> Triple("✗ FAILED",            OffpayColors.Danger,   Icons.Outlined.ErrorOutline)
         else       -> Triple(r.kind.uppercase(),    OffpayColors.InkMuted, Icons.Outlined.Info)
     }
+    // Prefer the on-chain tx link when we have one (topup, settled). Otherwise
+    // link to the counterparty's address page so the user can still see what
+    // wallet they sent to / received from on the explorer.
     val explorer = r.txHash?.let { Config.txUrl(it) }
+        ?: r.counterparty?.let { Config.addressUrl(it) }
     Row(
         Modifier
             .fillMaxWidth()
