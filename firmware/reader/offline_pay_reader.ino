@@ -157,13 +157,24 @@ void setup() {
 
 // Per-UID dedup: a MIFARE card sitting on the reader gets re-detected
 // by `PICC_IsNewCardPresent` every loop iteration after a halt(). If we
-// re-enter the read flow each time, we starve BT command processing
-// and spam serial. Track the last processed UID + timestamp; ignore
-// the same card again until either it leaves the field for a moment
-// or DEDUP_MS elapse — whichever happens first.
-#define DEDUP_MS 3000UL
+// re-enter the read flow each time, we starve BT command processing,
+// spam serial, AND drop incoming BT bytes (the ESP-IDF rx buffer is
+// finite). Track the last processed UID; the same card sitting in the
+// field is silently ignored until it physically leaves and a different
+// card / no card is seen, which clears `s_lastUid`.
 static String s_lastUid = "";
-static unsigned long s_lastUidMs = 0;
+
+// Sleep that keeps draining BT while it waits. UI helpers (flashRed,
+// flashGreen) used to call delay() directly which let the BT rx buffer
+// fill up and drop bytes. Use this instead so a phone's WRITE/CHALLENGE
+// traffic is never lost during a UI cue.
+static void btSleep(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    pumpBtCommands();
+    delay(5);
+  }
+}
 
 void loop() {
   // Drain any pending BT commands first — pairing / status / future
@@ -171,19 +182,25 @@ void loop() {
   // for a challenge doesn't have to wait for a card tap.
   pumpBtCommands();
 
-  if (!rfid.PICC_IsNewCardPresent()) { delay(50); return; }
-  if (!rfid.PICC_ReadCardSerial())   { delay(50); return; }
+  if (!rfid.PICC_IsNewCardPresent()) {
+    // No card in field — reset dedup so a card returning later is
+    // processed fresh.
+    s_lastUid = "";
+    btSleep(50);
+    return;
+  }
+  if (!rfid.PICC_ReadCardSerial())   { btSleep(50); return; }
 
   String uid = uidToHex(rfid.uid.uidByte, rfid.uid.size);
-  // Dedup window: same UID inside DEDUP_MS → silently halt and bail
-  // out without printing anything or running the read flow.
-  if (uid == s_lastUid && (millis() - s_lastUidMs) < DEDUP_MS) {
+  // Dedup: same physical card sitting on the reader → silently halt
+  // and let the BT pump get CPU. Cleared when the card physically
+  // leaves the field (PICC_IsNewCardPresent → false on next iter).
+  if (uid == s_lastUid) {
     halt();
-    delay(80);  // give the BT pump plenty of CPU
+    btSleep(80);
     return;
   }
   s_lastUid = uid;
-  s_lastUidMs = millis();
   Serial.println(String("[CARD] uid=") + uid);
 
   String voucherJson = readVoucher();
@@ -342,12 +359,16 @@ String uidToHex(byte *uid, byte n) {
   return s;
 }
 
+// LED + buzzer cues use btSleep() so the BT rx buffer never starves
+// during the visual feedback. Without this, ~1 second of plain delay()
+// is enough for the ESP-IDF rx ring to drop bytes from a phone WRITE
+// command — exact symptom that broke card-write testing.
 void flashGreen() {
   digitalWrite(LED_GREEN, HIGH);
   tone(BUZZER, 1200, 120);
-  delay(140);
+  btSleep(140);
   tone(BUZZER, 1600, 160);
-  delay(800);
+  btSleep(800);
   digitalWrite(LED_GREEN, LOW);
   noTone(BUZZER);
 }
@@ -356,9 +377,9 @@ void flashRed(const char *why) {
   Serial.println(String("[UI] red: ") + why);
   digitalWrite(LED_RED, HIGH);
   tone(BUZZER, 350, 250);
-  delay(300);
+  btSleep(300);
   tone(BUZZER, 350, 250);
-  delay(700);
+  btSleep(700);
   digitalWrite(LED_RED, LOW);
   noTone(BUZZER);
 }
