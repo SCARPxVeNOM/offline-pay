@@ -1,301 +1,395 @@
+<div align="center">
+
+<img src="docs/img/offpay_logo.png" alt="OFFPAY" width="160" />
+
 # OFFPAY
 
-> **Tap now. Chain later.** Two Android phones can transfer USDC peer-to-peer
-> with both phones fully offline, then the receiver settles to Polygon when
-> internet returns. No POS, no QR, no SMS — just NFC tap.
+**Tap. Settle later. Even when nobody has internet.**
 
-## What's new (v2 — unified wallet app)
+USDC payments where the customer is offline, the merchant is offline,
+and the chain isn't even nearby — yet the money still moves
+deterministically when *anyone* in the room has bandwidth.
 
-The current shippable build is `android-wallet/`. Both phones run the same
-app and can act as either sender or receiver per transaction. End-to-end
-flow:
+Polygon Amoy testnet · Solidity contracts · Android (Jetpack Compose) · ESP32 + RC522 firmware
 
-1. **Topup** (online): user wallet locks USDC into `OfflineVault` on
-   Polygon Amoy. Backend gas-sponsors the wallet so a fresh user has zero
-   onboarding friction.
-2. **Tap** (offline): sender enters amount → arms HCE → taps receiver's
-   phone. Sender's HCE signs a bearer voucher at tap time using the user's
-   own secp256k1 key + `NonceTracker`; the receiver's NFC reader verifies
-   the signature locally.
-3. **Settle** (online, opportunistic): receiver's phone calls
-   `OfflineVault.settleBearerBatch(vouchers, sigs, recipient)` directly
-   from its own wallet → vault transfers USDC to receiver. A
-   `NetworkCallback` fires this automatically on connectivity restore.
-
-Every settle tx is visible on Polygonscan. Both sender's `lockFunds` and
-receiver's `settleBearerBatch` show up under their respective wallet
-addresses.
-
-### What this build proves
-
-- ✅ Phone-to-phone NFC tap works end-to-end on real Android hardware
-  (tested OnePlus 6T ↔ Samsung).
-- ✅ Both users hold their own keys and sign their own on-chain
-  transactions — no custodial reliance during tap or settle.
-- ✅ Sender phone never opens an Ethereum RPC; only the receiver does
-  (and a backend-relay fallback if it lacks gas).
-- ✅ `OfflinePay` voucher digest is byte-identical across Solidity,
-  voucher.js, `VoucherSigner.kt`, and `VoucherVerifier.kt`.
-
-### Quick start (two phones)
-
-```powershell
-# 0) Deploy contracts to Polygon Amoy (one-time)
-cd contracts && npm install
-$env:DEPLOYER_PRIVATE_KEY = "0x…"
-npx hardhat run --network amoy scripts/deploy.js
-# Paste vault + usdc addresses into android-wallet/.../Config.kt
-
-# 1) Backend on laptop
-cd ..\backend && npm install && npm start
-
-# 2) Two phones via USB, ADB
-adb -s <oneplus> reverse tcp:4000 tcp:4000
-adb -s <samsung> reverse tcp:4000 tcp:4000
-
-# 3) Build + install the wallet APK
-cd ..\android-wallet
-.\gradlew.bat :app:assembleDebug
-adb -s <oneplus> install -r app\build\outputs\apk\debug\app-debug.apk
-adb -s <samsung> install -r app\build\outputs\apk\debug\app-debug.apk
-
-# 4) E2E protocol test (no UI required)
-cd ..\backend && node src/e2e_test.js
-```
-
-### v2 architecture (Option B — non-custodial)
-
-```
-[Sender phone]              [Receiver phone]            [Backend]              [Polygon Amoy]
-─ KeyVault                  ─ KeyVault                  ─ /api/wallet/init     ─ OfflineVault
-─ NonceTracker              ─ VoucherStore               (gas + USDC mint)      (lockFunds,
-─ VoucherSigner             ─ VoucherVerifier           ─ /api/wallet/redeem    settleBearerBatch)
-─ HCE service               ─ ReaderModeLoop             (gas-sponsor relay)   ─ MockUSDC (Amoy)
-─ SettlementClient          ─ SettlementClient
-  · approveAndLock            · settleBearerBatch
-```
-
-### Known limitations / pre-pilot work
-
-- MockUSDC on Amoy. Real-money flow needs an on-ramp like
-  [Onmeta](https://onmeta.in) — see
-  [docs/superpowers/specs/](docs/superpowers/specs/).
-- KeyVault stores private keys in `SharedPreferences` plaintext. Move to
-  Android Keystore before any pilot money moves.
-- Backend keeps a small custodial gas sponsor; for production this would
-  graduate to ERC-2771 meta-tx relayer.
+</div>
 
 ---
 
-## v1 (legacy) — customer/merchant split
+## The problem we're solving
 
-> Cryptographically-signed offline payments for India. **Both** the customer **and**
-> the merchant can be fully offline. Settlement happens on Polygon when either side
-> reconnects. Works with smartphones (NFC HCE), feature phones (MIFARE card), or even
-> a key fob.
+In the streets we live in — chai stalls, ration shops, auto rickshaws —
+the moment of payment is the moment your bandwidth is worst. The vendor
+is in a basement food court, the customer's data plan is throttled, both
+phones briefly drop to zero bars while the QR scanner spins. Today this
+means waiting, retrying, embarrassment. UPI **owns the rails when the
+rails are up**, but it has no graceful answer for the seconds when they
+aren't.
 
-OfflinePay turns crypto into a real payment rail for places where the network
-isn't always there — kirana stores, delivery riders, rural transit, festival
-grounds, power cuts. The secret is that vouchers are signed by the customer
-**ahead of time**, so a merchant phone can verify and accept payment with no
-internet at all, then settle in batch when it reconnects.
+**The hard cases that break every existing solution:**
+
+| Scenario | What today's apps do | What people actually need |
+|---|---|---|
+| Customer's phone in airplane mode | Refuses transaction | Pay anyway; settle whenever the customer reconnects |
+| Vendor's phone offline AND customer's phone offline | Total failure | The transaction still finalises — somehow |
+| Customer doesn't have a smartphone | Excluded from digital payments | Carry a contactless card; a card-reader handles them |
+| Vendor's hardware fails mid-day | Lost sales until repair | Any phone in the shop becomes the till in 30 seconds |
+| The relay node tries to steal the payment | — | Cryptographic proof binds the payee at tap time |
+
+OFFPAY exists for those exact moments. The customer can be offline. The
+merchant can be offline. The relay (literally any other phone in the
+mesh) does the on-chain work the moment it has signal — and the protocol
+is constructed so the relay **physically cannot redirect** the funds.
+
+---
+
+## What we discovered
+
+Three insights, layered:
+
+### 1. The voucher is a signed promise, not a payment
+
+A voucher is `(payer, recipient, amount, expiry, nonce, voucherId)` signed
+by the customer. **The chain does the bookkeeping; the voucher is just a
+verifiable IOU.** Both phones verify the signature locally with no chain
+contact at all. Replay is gated by a `voucherId` set on the contract, so a
+duplicate or relayed voucher reverts harmlessly.
+
+### 2. The recipient is part of the signed digest
+
+In v3 of `OfflineVault`, the customer's signature commits to the
+recipient's address. A relay node — any third phone with internet —
+broadcasts `settleBearerBatch(...)` and pays the gas. Because the recipient
+is bound at signing time, the relay literally cannot redirect funds to
+itself. The vault checks the signature, decrements `lockedBalance[payer]`,
+transfers USDC to `voucher.recipient`. Done.
+
+### 3. For physical bearer cards, the merchant binds at tap time
+
+This is the part that breaks every other "offline blockchain" attempt. A
+MIFARE card holds a customer's signed voucher with `recipient = 0x0` —
+nobody is named yet. When the customer taps it on a vendor's ESP32 reader,
+the **reader signs a fresh endorsement**:
+`(voucherId, device, merchantPrimary, timestamp)`. The endorsement
+commits to the vendor's actual wallet, then `settleBearerWithEndorsement`
+verifies *both* signatures on chain and pays the vendor — not the relay,
+not msg.sender, not whoever found the card on the floor. **The vendor's
+ESP32 is the unforgeable binding authority.**
+
+---
+
+## System architecture
 
 ```
-   ┌──────────────┐                                ┌──────────────┐
-   │   Customer   │  signs vouchers when online    │   Customer   │
-   │  smartphone  │ ─────────────────────────────► │ MIFARE card  │
-   │   or wallet  │                                │  (or key fob)│
-   └──────┬───────┘                                └──────┬───────┘
-          │                                               │ tap
-          │ HCE / NFC                                     ▼
-          ▼                                       ┌──────────────┐
-   ┌──────────────┐ Bluetooth SPP                 │ ESP32+RC522  │
-   │   Merchant   │ ◄──────────────────────────── │   reader     │
-   │  smartphone  │                                └──────────────┘
-   └──────┬───────┘
-          │ verify ECDSA signature offline (BouncyCastle)
-          │ store accepted voucher in Room DB
-          │
-          │  …merchant comes back online…
-          ▼
-   ┌─────────────────────────┐ batch tx ┌────────────────────┐
-   │  OfflinePay backend     │─────────►│  Polygon Amoy /    │
-   │  (or merchant directly) │          │  Mainnet           │
-   └─────────────────────────┘          │  OfflineVault.sol  │
-                                        └────────────────────┘
+                          POLYGON AMOY
+                         ┌────────────┐
+                         │ OfflineVault│  ← settles vouchers, holds funds
+                         │ + MockUSDC │
+                         │ + Registry │
+                         └─────▲──────┘
+                               │ tx (gas paid by relay)
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+   ┌────┴────┐            ┌────┴────┐            ┌────┴────┐
+   │ Phone A │── BLE/WiFi─│ Phone B │── BLE/WiFi─│ Phone C │
+   │CUSTOMER │   mesh     │MERCHANT │   mesh     │ RELAY   │
+   │ offline │            │ offline │            │ online  │
+   └────┬────┘            └────▲────┘            └─────────┘
+        │                      │
+        │ NFC tap              │ BT SPP
+        │ (HCE voucher)        │
+        │                      │
+        │                 ┌────┴────┐
+        │                 │  ESP32  │  ← merchant's "card terminal"
+        │                 │ + RC522 │     reads MIFARE cards
+        └─── MIFARE ─────►│  reader │     signs endorsements
+              card        └─────────┘     bonded to phone B
 ```
 
-## Why this is different from UPI Lite
+**Three layers, each replaceable:**
 
-UPI Lite **still requires the issuer bank to be online** for the spend ledger
-to validate. The merchant device is offline; the customer's bank isn't. That
-breaks during full-zone power outages and where bank correspondents simply
-aren't reachable.
+1. **Phone-to-phone NFC tap** — instant peer payments without any extra
+   hardware. Works between any two phones running the OFFPAY app.
+2. **Phone-to-mesh-to-relay** — when both customer and merchant are
+   offline, any third phone within Bluetooth/Wi-Fi-Direct range and
+   carrying internet broadcasts the settle on their behalf. Built on
+   Google Nearby Connections (`P2P_CLUSTER`) with a deterministic
+   tie-break to avoid simultaneous-connect deadlocks.
+3. **ESP32 merchant box** — a $5 reader that turns a MIFARE card into a
+   spending instrument. The customer's phone never has to be at the stall
+   — the card is the instrument, the reader is the binding authority.
 
-OfflinePay's voucher is a **self-verifying** message:
-`(payer, merchant, amount, expiry, nonce, voucherId, chainId, vault)` hashed
-with keccak256 and signed with secp256k1 (EIP-191). **The merchant phone
-recovers the signer locally** — no third party online. Settlement on Polygon
-costs roughly 1 cent per batch of 50 vouchers.
+---
 
-| Property                       | UPI Lite                       | OfflinePay                                   |
-|--------------------------------|--------------------------------|----------------------------------------------|
-| Bank online for verification?  | Yes (issuer must be reachable) | **No**                                       |
-| Customer offline?              | Yes                            | Yes                                          |
-| Merchant offline?              | Partially (hold-and-replay)    | **Yes — voucher is cryptographically valid** |
-| Cross-border?                  | No                             | Yes (USDC settles anywhere)                  |
-| Works without smartphone?      | No                             | **Yes — MIFARE card or key fob**             |
-| Settlement layer?              | NPCI                           | Public chain (Polygon) → bank-agnostic       |
+## The ESP32 merchant box
 
-## What's in this repo
+The reader is a **stateless trust anchor** for the merchant. It's not a
+backend, it's not a server — it's a notary that stamps every card-tap
+with the merchant's wallet address.
 
 ```
-offlinepay/
-├── contracts/         Hardhat — OfflineVault.sol + tests + Amoy deploy script
-├── backend/           Node/Express — voucher issuer, mock UPI top-up, settlement queue
-├── firmware/
-│   ├── reader/        ESP32 sketch — reads MIFARE card and forwards over Bluetooth
-│   └── topup/         ESP32 sketch — fetches voucher from backend, writes to MIFARE
-├── android-merchant/  Kotlin — Bluetooth SPP receive + offline verify + Room queue + sync
-├── android-customer/  Kotlin — HCE phone-to-phone + top-up UI + payer key vault
-├── simulator/         Node — end-to-end CLI demo, single-tap helper, stress test
-├── dashboard/         Single-file HTML — live judge-friendly console
-└── docs/              Pitch one-pager, demo runbook, threat model
+ ┌──────────────────────────────────────────────────────────┐
+ │                       ESP32 BOX                          │
+ │                                                          │
+ │  ┌────────┐   ┌────────────┐   ┌─────────────────┐       │
+ │  │ RC522  │──►│  Sketch    │──►│ secp256k1 key   │       │
+ │  │  RFID  │   │ loop()     │   │ + Keccak-256    │       │
+ │  └────────┘   │ pumpBT()   │   │ in NVS          │       │
+ │               │ onClaim()  │   └─────────────────┘       │
+ │  ┌────────┐   │ onAuth()   │                             │
+ │  │ Buzzer │◄──│ onWriteData│   ┌─────────────────┐       │
+ │  │ + LEDs │   │            │──►│ BluetoothSerial │       │
+ │  └────────┘   └────────────┘   │  SPP to phone   │       │
+ │                                └─────────────────┘       │
+ └──────────────────────────────────────────────────────────┘
 ```
 
-## Quick start (no hardware needed — full demo on a laptop)
+**Three command surfaces over BT SPP:**
 
-You will need **Node.js 20+** and **npm**. That's it.
+| Command | Purpose | Auth |
+|---|---|---|
+| `CLAIM` | A phone takes ownership of this reader | Phone signs a fresh nonce; firmware verifies + persists `owner` to NVS |
+| `AUTH` + `WRITE_DATA` | Owner asks reader to write a voucher onto the next-tapped card | Two-line protocol (split for the ESP-IDF 512-byte SPP RX limit); EIP-191 signature over `OFFPAY-WRITE-V1 \|\| esp_mac \|\| nonce \|\| keccak256(json)` |
+| Card tap | Read existing voucher → emit `VOUCHER` + `ENDORSE` over BT to bonded phone | Reader's own secp256k1 key signs `(voucherId, device, owner, ts, chainId, vault)` |
 
-```bash
-# Terminal A — local chain
-cd contracts
-npm install
-npx hardhat node
+**Mode-aware loop**: the firmware boots in `IDLE`, switches to `READ` only
+when the phone explicitly asks (`MODE READ` over BT — sent by the merchant
+phone when it opens the Receive screen). Without this, the read loop
+hammers the RC522's SPI bus and starves Bluetooth, dropping inbound
+WRITE bytes.
 
-# Terminal B — deploy
-cd contracts
-npm run deploy:local
+**Sentinel-based replay protection**: after a successful settle, the
+firmware overwrites all 21 voucher data blocks with `USED____________`
+so the same physical card can't double-spend even before the on-chain
+nullifier propagates.
 
-# Terminal C — backend
-cd backend
-npm install
-cp .env.example .env
-npm run dev
+**Ownership is transferable**: any phone with this app can re-pair the
+reader by sending a fresh `CLAIM`. The latest valid signature wins. So a
+single ESP32 can be passed between customers and stalls in a market
+without any provisioning step beyond opening the app.
 
-# Terminal D — open the live console
-cd dashboard
-python -m http.server 5173        # or any static server
-# then open http://localhost:5173
+---
+
+## Full user flow — three phones, one card, zero internet at the stall
+
+This is the hardest scenario we proved end-to-end:
+
+> **Setup**: Customer (Nothing phone) tops up $5 at home over Wi-Fi.
+> Vendor (OnePlus) is at the stall with an ESP32 reader. A bystander
+> (Samsung) walks past with regular LTE.
+
+```
+1. AT HOME (online, customer)
+─────────────────────────────
+    Nothing phone:  signNextBearerForCard(amount=$1)
+                    → voucher with recipient = 0x0
+                    → BluetoothSerial → ESP32 → MIFARE write
+    MIFARE card now holds: {payer=Nothing, recipient=0, sig=...}
+
+2. AT THE STALL (offline, customer + merchant)
+──────────────────────────────────────────────
+    Customer hands card to merchant.
+    OnePlus is bonded to ESP32 (claimed earlier).
+    OnePlus opens Receive screen → BT MODE READ → reader wakes.
+    Customer taps card on ESP32:
+
+      ESP32 reads voucher from blocks 4-30
+      ESP32 signs ENDORSE over (voucherId, esp_addr,
+                                onePlus_primary_wallet, ts)
+      ESP32 → BT → OnePlus:
+          VOUCHER 0x9d76… 271e1d25 {"i":...,"p":...}
+          ENDORSE 12345 0xc6cf…(OnePlus) 0x9d76…(ESP) 0xa1b2…
+      OnePlus stores voucher row + endorsement bundle
+      OnePlus → BT → ESP32: ACCEPT
+      ESP32 writes USED____________ across the card
+      OnePlus gossips voucher+endorsement on the mesh
+
+3. RELAY SETTLE (Samsung walks into BT range, has internet)
+───────────────────────────────────────────────────────────
+    Samsung receives mesh replica:
+      {voucher with recipient=0x0,
+       endorsement(voucherId, esp_addr, OnePlus_primary, ts, sig)}
+    Samsung's autoSettle picks it up → recipient=0 + endorsement set
+      → calls settleBearerWithEndorsement(...)
+    Contract verifies BOTH signatures on chain:
+      - voucher sig recovers to Nothing (the payer)
+      - endorsement sig recovers to ESP32's wallet
+      - merchantPrimary committed inside endorsement = OnePlus
+    USDC transferred: vault → OnePlus
+    Samsung emits "settled" over the mesh.
+
+4. EVERYONE'S BALANCE UPDATES
+─────────────────────────────
+    Nothing (customer):   lockedBalance ↓ $1
+    OnePlus (merchant):   usdc.balanceOf ↑ $1
+    Samsung (relay):      paid the gas, no other change
 ```
 
-Click **Run end-to-end demo** in the dashboard. Watch the voucher feed light
-up, the on-chain settled count climb, and the tx hash appear. Or run it from
-the CLI:
+**No phone in this flow needed both BT and internet at the same moment**.
+The customer was online once, at home. The merchant never had internet.
+The relay had internet but never touched a card. **The chain saw two
+signatures and paid the right wallet.**
 
-```bash
-cd simulator && npm install
-node demo.js
+---
+
+## Real-time balances across devices
+
+OFFPAY isn't a static balance display — every phone in the mesh updates
+within seconds of any chain event:
+
+- **1-second render tick** recomputes spendable from the local cache
+  (locked − in-flight) so the UI feels responsive at signing time.
+- **8-second chain poll** when online pulls fresh `lockedBalance` and
+  `usdc.balanceOf` so the on-chain figure stays honest. Receivers'
+  wallet balance updates automatically; senders' locked balance ticks
+  down when their vouchers settle.
+- **Mesh `settled` event**: when any peer settles a voucher on chain,
+  it gossips the tx hash. Every other phone in range immediately marks
+  the voucher settled in its `BalanceCache`, drops in-flight, and ticks
+  the spendable up. **No chain RPC required on the receiver's side.**
+- **`NetworkCallback.onAvailable`** triggers an immediate refresh the
+  moment Wi-Fi reconnects.
+
+The receiver who got paid offline sees `ON CHAIN` climb the second the
+mesh delivers the settled tx. The customer who paid offline sees
+`SPENDABLE` drop the instant they sign. The relay sees nothing change —
+they just paid the gas.
+
+---
+
+## On-chain proof
+
+**Live deployment on Polygon Amoy**
+
+| Contract | Address |
+|---|---|
+| **OfflineVault** (v3.1 — bearer + endorsement) | [`0x3E73aa7506c5a833E0842c948458af9d63C19dCd`](https://amoy.polygonscan.com/address/0x3E73aa7506c5a833E0842c948458af9d63C19dCd) |
+| OfflineVault (v3 — recipient-bound bearer) | [`0x2D8218329389545Cb12b37e2ED961BDB97d3661f`](https://amoy.polygonscan.com/address/0x2D8218329389545Cb12b37e2ED961BDB97d3661f) |
+| MerchantRegistry | [`0xc1Ac9cAF9D7aE09dF1a1d587587fF1Ae6420Cc1a`](https://amoy.polygonscan.com/address/0xc1Ac9cAF9D7aE09dF1a1d587587fF1Ae6420Cc1a) |
+| MockUSDC (test stable) | [`0x17ffe8373658Fb333530e4446becb19dB6239e1e`](https://amoy.polygonscan.com/address/0x17ffe8373658Fb333530e4446becb19dB6239e1e) |
+| Backend gas signer | [`0x092661531D9186Fa6E48501A5e3b508B3F52e64c`](https://amoy.polygonscan.com/address/0x092661531D9186Fa6E48501A5e3b508B3F52e64c) |
+
+**Settled transactions — pulled live from `VoucherSettled(...)` event logs**
+
+These are real on-chain settlements from the v3.1 vault. Each one is a
+voucher that started as bytes on a MIFARE card or an NFC tap and ended as
+a USDC transfer to the recipient's wallet:
+
+- [`0x00dc3a8120080b42eec8ad3e65650011c56ebd5de7bedcae8864bf99a7b67a3c`](https://amoy.polygonscan.com/tx/0x00dc3a8120080b42eec8ad3e65650011c56ebd5de7bedcae8864bf99a7b67a3c)
+- [`0x49fb051c07c558d87562b261a21812de3d3c5b6cbdef475c89e82ec83d127ea1`](https://amoy.polygonscan.com/tx/0x49fb051c07c558d87562b261a21812de3d3c5b6cbdef475c89e82ec83d127ea1)
+- [`0xa23e0724a317627975bebc0a0b6cd577ff85e6c0fba99b9488cdc8d1dd0aa87c`](https://amoy.polygonscan.com/tx/0xa23e0724a317627975bebc0a0b6cd577ff85e6c0fba99b9488cdc8d1dd0aa87c)
+- [`0xd17685dfa016f4a7f0597640918a93f0f9961bd728476ce030c28d2de911165a`](https://amoy.polygonscan.com/tx/0xd17685dfa016f4a7f0597640918a93f0f9961bd728476ce030c28d2de911165a)
+- [`0x4f277472b49131e067549b6925ff4f59f915c28ec545b005012524cf98ec2d1e`](https://amoy.polygonscan.com/tx/0x4f277472b49131e067549b6925ff4f59f915c28ec545b005012524cf98ec2d1e)
+- [`0x3871768293aada94fc1f1e01d619cae5a29b75f7c3532c091288ea79b3c4312c`](https://amoy.polygonscan.com/tx/0x3871768293aada94fc1f1e01d619cae5a29b75f7c3532c091288ea79b3c4312c)
+
+**Earlier v3 vault settlements** (recipient-bound bearer flow, before the
+bearer-card layer):
+
+- [`0xe8e90a2200396f00a9133fe5fd67463ae78efa77724b25ea9f0273011337012d`](https://amoy.polygonscan.com/tx/0xe8e90a2200396f00a9133fe5fd67463ae78efa77724b25ea9f0273011337012d)
+- [`0x29a4d2a235e55dc5cfe9221276fb18502355a3eb0e629beb3f5a34e5efa93ff0`](https://amoy.polygonscan.com/tx/0x29a4d2a235e55dc5cfe9221276fb18502355a3eb0e629beb3f5a34e5efa93ff0)
+- [`0x696f1f9372f8e317dbfb03d1bac4d44f6844d7ff4a70aee5eefd0b64bce183b9`](https://amoy.polygonscan.com/tx/0x696f1f9372f8e317dbfb03d1bac4d44f6844d7ff4a70aee5eefd0b64bce183b9)
+
+Across both vaults, **39+ on-chain settlements** logged from real
+phone-to-phone and card-based test flows during development.
+
+---
+
+## Contract design highlights
+
+### `OfflineVault.settleBearerWithEndorsement`
+
+The new function added in v3.1, the cornerstone of true-bearer cards:
+
+```solidity
+function settleBearerWithEndorsement(
+    Voucher calldata v,
+    bytes calldata voucherSig,
+    address device,             // ESP32 wallet that endorsed
+    address merchantPrimary,    // who actually gets paid
+    uint256 endorsementTs,
+    bytes calldata deviceSig
+) external whenNotPaused nonReentrant {
+    require(v.merchant  == address(0), "not bearer");
+    require(v.recipient == address(0), "must be true bearer");
+    require(merchantPrimary != address(0), "primary=0");
+    require(!usedVouchers[v.voucherId], "already settled");
+    require(block.timestamp <= v.expiry, "expired");
+    require(v.amount > 0 && v.amount <= maxSinglePayment, "bad amount");
+    require(lockedBalance[v.payer] >= v.amount, "insufficient locked");
+
+    bytes32 vDigest = voucherDigest(v);
+    require(vDigest.toEthSignedMessageHash().recover(voucherSig) == v.payer,
+            "bad voucher sig");
+
+    bytes32 eDigest = endorsementDigest(v.voucherId, device,
+                                        merchantPrimary, endorsementTs);
+    require(eDigest.toEthSignedMessageHash().recover(deviceSig) == device,
+            "bad endorsement sig");
+
+    usedVouchers[v.voucherId] = true;
+    lockedBalance[v.payer]   -= v.amount;
+    require(usdc.transfer(merchantPrimary, v.amount), "payout failed");
+    emit VoucherSettled(v.voucherId, v.payer, merchantPrimary,
+                        v.amount, v.nonce);
+}
 ```
 
-That single command will print a step-by-step walkthrough of the entire flow
-(top-up, voucher issuance, 5 offline taps, batch settle, replay rejection,
-final stats).
+**Two signatures, one transaction.** A relay broadcasting this can:
 
-## Hardware demo (ESP32 + RC522)
+- ✗ NOT redirect to themselves — `merchantPrimary` is committed inside
+  `deviceSig`. Tampering with it invalidates the signature.
+- ✗ NOT replay an old endorsement — the voucher's `usedVouchers` flag
+  flips after the first successful settle.
+- ✗ NOT forge an endorsement — they don't have the ESP32's private key.
+- ✗ NOT pay themselves the gas back — there's no msg.sender refund logic.
 
-If you've soldered the RC522 headers and wired it as in `firmware/README.md`:
+The relay gets nothing for their effort except participating in the
+mesh. Which is exactly the role we wanted.
 
-1. Flash `firmware/topup/topup_writer.ino` (edit the WiFi creds + backend URL),
-   tap a blank MIFARE Classic 1K card → it gets loaded with a fresh voucher.
-2. Flash `firmware/reader/offline_pay_reader.ino` to the same or a second
-   ESP32 → it broadcasts as Bluetooth device `OfflinePay_Reader`.
-3. Pair `OfflinePay_Reader` from the merchant Android phone, run the merchant
-   app, then tap the loaded card on the reader. The phone shows the verified
-   voucher, the LED flashes green, the buzzer beeps, and the card's voucher
-   blocks are overwritten with `USED____________`.
-
-## Polygon Amoy testnet
-
-```bash
-# Get free Amoy MATIC: https://faucet.polygon.technology
-cd contracts
-cp .env.example .env       # set DEPLOYER_PRIVATE_KEY
-npm run deploy:amoy
-# update CHAIN_RPC_URL + CHAIN_ID + VAULT_ADDRESS + USDC_ADDRESS in backend/.env
-```
-
-The `MockUSDC.sol` contract gets deployed alongside Vault on Amoy because real
-USDC isn't on Amoy — for mainnet replace it with the canonical address (the
-deploy script does this for you when network = `polygon`).
-
-## Voucher format (the canonical hash)
-
-The `voucherDigest` function in `OfflineVault.sol` is the source of truth.
-The backend (`backend/src/voucher.js`) and the merchant Android app
-(`android-merchant/.../VoucherVerifier.kt`) reproduce the same bytes:
+### Endorsement digest (mirrored byte-for-byte across all three platforms)
 
 ```
 keccak256(abi.encode(
-    payer    : address,
-    merchant : address,        // 0x0 = bearer (any merchant can claim)
-    amount   : uint256,        // USDC base units (6 decimals)
-    expiry   : uint256,        // unix seconds
-    nonce    : uint256,        // strictly > lastNonce[payer]
-    voucherId: bytes32,        // unique id per voucher
-    chainId  : uint256,        // bound to network
-    vault    : address         // bound to deployment
+    keccak256("OFFPAY-ENDORSE-V1"),
+    voucherId,           // bytes32
+    device,              // address
+    merchantPrimary,     // address
+    endorsementTs,       // uint256
+    block.chainid,       // uint256
+    address(this)        // address
 ))
 ```
 
-It's then EIP-191 prefixed (`"\x19Ethereum Signed Message:\n32"`) before
-signing with secp256k1. The same signature works for both offline merchant
-verification (`ecrecover`) and on-chain settlement (`ECDSA.recover`).
+This same byte layout is reproduced:
 
-## Threat model & limits
+- **Solidity** in `OfflineVault.endorsementDigest()`
+- **C++** in `firmware/reader/offline_pay_reader.ino:emitEndorsement()`
+  using a hand-rolled Keccak-256 (not `mbedtls_sha3` — different padding!)
+- **Kotlin** in `EndorsementDigest.kt` using Web3j's `Hash.sha3` and
+  `TypeEncoder.encode`
 
-Offline payments cannot prevent **all** double-spend without an oracle. We
-bound the worst-case loss with three knobs in the contract:
-
-| Knob              | Default | Purpose                                              |
-|-------------------|---------|------------------------------------------------------|
-| `maxSinglePayment`| $2.00   | Caps damage from a single stolen card / fake tap.    |
-| `maxLockedBalance`| $5.00   | Caps total exposure per customer per top-up cycle.   |
-| `defaultVoucherTTL`| 24 h   | Stale vouchers expire — limits the attack window.    |
-
-A double-spent voucher across two offline merchants is detected on settlement
-(only the first to reach the chain wins). The losing merchant's app shows a
-reconciliation toast — same UX as a chargeback. For low-amount caps this is
-acceptable; for higher amounts the customer phone refreshes its nonce by
-pinging the backend, which is the same model as UPI Lite.
-
-The merchant phone also keeps a local SQLite cache of every voucherId it has
-ever seen, so the same card cannot be tapped twice on the same merchant.
-
-## What still needs work for production
-
-- **MIFARE Classic is broken crypto.** Demo uses default key 0xFFFF…; for a
-  real product use MIFARE DESFire EV2 with AES-128 and per-card derived keys.
-- **Custodial vs non-custodial.** The demo's `/api/topup` uses a backend wallet
-  as proxy payer. The real flow is: customer's phone holds the key in the
-  hardware-backed Keystore (StrongBox if available) and signs vouchers itself.
-  The non-custodial path is wired in the Android customer app's `KeyVault.kt`.
-- **Onmeta integration.** Replace the mock UPI in `/api/topup` with a real
-  on/off-ramp — Onmeta, Transak, Bridge.xyz all expose an INR→USDC endpoint.
-- **Chain choice.** Polygon PoS is fine; for true sub-cent gas, deploy on
-  Polygon zkEVM, Base, or even Solana via ECDSA precompiles.
-
-## Repo navigation tips
-
-- All contract logic + tests in `contracts/contracts/OfflineVault.sol` and
-  `contracts/test/OfflineVault.test.js`. **`npm test` → 11/11 pass.**
-- Backend voucher signing: `backend/src/voucher.js` (`voucherDigest`,
-  `signVoucher`, `recoverVoucherSigner`).
-- Demo entry points: `dashboard/index.html`, `simulator/demo.js`.
-- The `glowing-painting-beaver.md` plan file in `~/.claude/plans/` describes
-  every architectural decision and the status of each component.
+Test coverage in `contracts/test/OfflineVault.test.js` includes 30
+passing cases including: forged endorsement rejection, primary tampering
+rejection, double-spend across both bearer paths, and the happy-path
+end-to-end.
 
 ---
 
-Built for a hackathon. The architecture is real; some sharp edges are not yet
-production-grade. PRs welcome 🤝
+## Repo layout
+
+```
+contracts/        Hardhat workspace — OfflineVault, MerchantRegistry, MockUSDC, tests, deploy scripts
+backend/          Node 18+ Express. Gas-sponsors first-time wallets, exposes /rpc proxy + /api/wallet/init.
+android-wallet/   Kotlin Compose wallet — both customer and merchant in one app.
+firmware/reader/  ESP32 sketch + secp256k1 device wallet (NVS-persisted).
+docs/             Pitch, threat model, demo runbook, design assets.
+```
+
+**Critical files to read in order:**
+
+1. `contracts/contracts/OfflineVault.sol` — the rules of the system
+2. `firmware/reader/offline_pay_reader.ino` — the merchant box state machine
+3. `android-wallet/.../MeshBroadcaster.kt` — Nearby Connections layer with retry queue, address tie-break, settled-event gossip
+4. `android-wallet/.../EspWriteClient.kt` — the two-step phone↔reader auth protocol
+5. `android-wallet/.../HomeActivity.kt` — real-time balance loop + autoSettle dispatcher
