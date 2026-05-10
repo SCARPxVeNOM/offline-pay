@@ -74,17 +74,7 @@ object EspWriteClient {
         bondedBtMac: String,
         voucherJson: String,
         keyVault: KeyVault,
-    ): Result = withContext(Dispatchers.IO) {
-        // Hard cap on the entire attempt. Android's BluetoothSocket.connect()
-        // has been observed to hang indefinitely after a half-broken prior
-        // session — without a timeout the UI sits on "Tap MIFARE card on
-        // the reader…" forever. 12s is plenty for a clean handshake;
-        // anything longer = something's wrong, surface it so the user can
-        // retry.
-        withTimeoutOrNull(12_000L) {
-            attemptWriteOnceInner(bondedBtMac, voucherJson, keyVault)
-        } ?: Result.Failed("connect/handshake timeout — try again")
-    }
+    ): Result = attemptWriteOnceInner(bondedBtMac, voucherJson, keyVault)
 
     private suspend fun attemptWriteOnceInner(
         bondedBtMac: String,
@@ -106,21 +96,31 @@ object EspWriteClient {
 
         var socket: BluetoothSocket? = null
         try {
-            @Suppress("MissingPermission")
-            socket = bt.createRfcommSocketToServiceRecord(Config.BT_SPP_UUID)
-            @Suppress("MissingPermission")
-            try {
-                socket.connect()
-            } catch (e: Throwable) {
-                // Fallback: insecure RFCOMM works when the bond goes
-                // sideways but the device is still discoverable.
-                Log.w(TAG, "secure connect failed (${e.message}); trying insecure")
-                runCatching { socket?.close() }
+            // BT classic SPP connect can hang for a long time on a
+            // half-broken session. Bound just the connect step so an
+            // attempt times out cleanly while still leaving plenty of
+            // time afterwards for the user to physically tap the card.
+            val connectResult = withTimeoutOrNull(8_000L) {
                 @Suppress("MissingPermission")
-                socket = bt.createInsecureRfcommSocketToServiceRecord(Config.BT_SPP_UUID)
-                @Suppress("MissingPermission")
-                socket.connect()
+                val s = bt.createRfcommSocketToServiceRecord(Config.BT_SPP_UUID)
+                try {
+                    @Suppress("MissingPermission")
+                    s.connect()
+                    s
+                } catch (e: Throwable) {
+                    // Fallback: insecure RFCOMM works when the bond goes
+                    // sideways but the device is still discoverable.
+                    Log.w(TAG, "secure connect failed (${e.message}); trying insecure")
+                    runCatching { s.close() }
+                    @Suppress("MissingPermission")
+                    val s2 = bt.createInsecureRfcommSocketToServiceRecord(Config.BT_SPP_UUID)
+                    @Suppress("MissingPermission")
+                    s2.connect()
+                    s2
+                }
             }
+            socket = connectResult
+                ?: return@withContext Result.Failed("BT connect timeout — try again")
             val out = socket.outputStream
             val reader = BufferedReader(InputStreamReader(socket.inputStream))
 
