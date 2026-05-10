@@ -175,13 +175,27 @@ class HomeActivity : ComponentActivity() {
                 }
             }
         }
-        // Periodic re-render so "synced 32s ago" keeps ticking. Cheap —
-        // renderBalance only touches a SharedPreferences read and 50
-        // ledger rows, no chain RPC.
+        // Two cadences:
+        //  • Every 1s: renderBalance() — recomputes spendable from the
+        //    cache + ledger, refreshes the "synced Xs ago" label.
+        //    Cheap (SharedPreferences + ~50 ledger rows, no RPC).
+        //  • Every 8s: refreshChainBalance() — pulls lockedBalance(self)
+        //    + usedVouchers(sentIds) from chain so on-screen "ON CHAIN"
+        //    matches reality. Online-only; no-op when offline.
+        // Together: the user sees a balance that updates the instant a
+        // voucher is signed (in-flight goes up locally), the instant a
+        // settle lands (in-flight goes down via chain refresh OR mesh
+        // event), and the freshness label is always honest.
         lifecycleScope.launch {
             while (true) {
-                kotlinx.coroutines.delay(30_000)
+                kotlinx.coroutines.delay(1_000)
                 renderBalance()
+            }
+        }
+        lifecycleScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(8_000)
+                if (isOnline()) refreshChainBalance()
             }
         }
         // ESP bond → Dash state. Reflects pairing in real time so the
@@ -435,6 +449,10 @@ class HomeActivity : ComponentActivity() {
             }
             if (recipientBound.isEmpty()) {
                 renderBalance()
+                // Pull on-chain truth right after a settle so the
+                // "ON CHAIN $X" line drops to the new locked figure
+                // instantly, not after the next 8s tick.
+                if (endorsed.isNotEmpty()) refreshChainBalance()
                 if (endorsed.isNotEmpty() || unendorsedBearer.isNotEmpty()) {
                     state.value = state.value.copy(
                         settleStatus = "⛓ settled ${endorsed.size}; quarantined ${unendorsedBearer.size}")
@@ -503,8 +521,12 @@ class HomeActivity : ComponentActivity() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "network available -> auto-settle")
+                Log.d(TAG, "network available -> auto-settle + balance refresh")
                 homeScope.launch { autoSettle() }
+                // Immediately re-pull chain truth so the "ON CHAIN"
+                // figure stops being stale the moment the user comes
+                // back online — don't wait for the 8s ticker.
+                refreshChainBalance()
             }
         }
         cm.registerNetworkCallback(req, cb)
