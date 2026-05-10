@@ -148,11 +148,25 @@ object EspWriteClient {
                 keyVault.keyPair.publicKey, 128
             )
 
-            // 3. Send WRITE. Firmware enters card-write mode and now waits
-            //    for the user to physically tap the MIFARE on the reader.
-            val writeLine = "WRITE ${keyVault.address} $pubkeyHex $sigHex $voucherJson\n"
-            Log.d(TAG, "WRITE outbound (${writeLine.length} chars)")
-            out.write(writeLine.toByteArray()); out.flush()
+            // 3a. Send AUTH (auth fields only, ~280 bytes — fits cleanly
+            //     under the firmware's 512-byte SPP RX queue limit on
+            //     Arduino-ESP32 2.0.x).
+            val authLine = "AUTH ${keyVault.address} $pubkeyHex $sigHex\n"
+            Log.d(TAG, "AUTH outbound (${authLine.length} chars)")
+            out.write(authLine.toByteArray()); out.flush()
+            val authAck = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
+                readUntilOneOf(reader, listOf("AUTH_OK", "ERR "))
+            } ?: return@withContext Result.Failed("no AUTH_OK from reader (timeout)")
+            if (authAck.startsWith("ERR ")) {
+                return@withContext Result.Failed(authAck.removePrefix("ERR ").trim())
+            }
+
+            // 3b. Send WRITE_DATA carrying just the JSON (~340 bytes).
+            //     Firmware enters card-write mode after this and waits
+            //     for the user to physically tap the MIFARE.
+            val dataLine = "WRITE_DATA $voucherJson\n"
+            Log.d(TAG, "WRITE_DATA outbound (${dataLine.length} chars)")
+            out.write(dataLine.toByteArray()); out.flush()
 
             // 4. Wait for the result. May take up to ~30s for the user
             //    to actually tap the card.

@@ -73,6 +73,22 @@ static const char* modeName(Mode m) {
 MFRC522 rfid(SS_PIN, RST_PIN);
 BluetoothSerial SerialBT;
 
+// Two-step write protocol. Arduino-ESP32 2.0.x's BluetoothSerial RX
+// queue defaults to 512 bytes and silently drops the tail of any
+// burst larger than that. Our write payload (auth + JSON) totals
+// ~620 bytes, which exceeds the limit.
+//
+// Workaround: phone sends AUTH first (≈280 bytes) carrying the
+// signature fields, then WRITE_DATA (≈340 bytes) carrying just the
+// JSON. Both fit comfortably; firmware accumulates them.
+struct PendingWriteAuth {
+  bool     valid = false;
+  uint8_t  addr20[20];
+  uint8_t  pub65[65];
+  uint8_t  sig[65];
+};
+static PendingWriteAuth s_pendingWriteAuth;
+
 // Pending claim challenge: a fresh 16-byte nonce is generated on every
 // REQUEST_CHALLENGE from the phone. The next CLAIM frame must sign over
 // (CLAIM_DOMAIN || espBtMacBytes || nonce). Single-pending-nonce model
@@ -151,15 +167,10 @@ void setup() {
   pinMode(LED_RED,   OUTPUT);
   pinMode(BUZZER,    OUTPUT);
 
-  // Bump the SPP RX buffer BEFORE begin(). Default is 256 bytes — way
-  // too small for the 627-byte WRITE command that the phone sends in a
-  // single write. Without this the tail of WRITE is silently dropped at
-  // the BT controller level and our pump never sees a complete \n line.
-  SerialBT.setRxBufferSize(4096);
   if (!SerialBT.begin("OfflinePay_Reader")) {
     Serial.println("[BT] init failed");
   } else {
-    Serial.println("[BT] OfflinePay_Reader online (rx buf 4096)");
+    Serial.println("[BT] OfflinePay_Reader online");
   }
 
   // Provision (or load) this device's secp256k1 wallet. Address must be
@@ -514,7 +525,14 @@ void handleBtLine(const String& line) {
     onRequestChallenge();
   } else if (line.startsWith("CLAIM ")) {
     onClaim(line);
+  } else if (line.startsWith("AUTH ")) {
+    onWriteAuth(line);
+  } else if (line.startsWith("WRITE_DATA ")) {
+    onWriteData(line);
   } else if (line.startsWith("WRITE ")) {
+    // Legacy single-line WRITE — kept for backward compat but
+    // affected by the 512-byte RX overflow. New phone code uses
+    // AUTH + WRITE_DATA pair instead.
     onWrite(line);
   } else if (line == "STATUS") {
     onStatus();
@@ -651,6 +669,143 @@ void onClaim(const String& line) {
 
 #define WRITE_WAIT_MS 30000UL
 #define WRITE_DOMAIN  "OFFPAY-WRITE-V1"
+
+// Step 1 of the two-step write: parse + stash the auth bundle. Phone
+// must send REQUEST_CHALLENGE first to obtain a fresh nonce; AUTH
+// carries the signature over (DOMAIN || mac || nonce || keccak(json)).
+// On success we ACK with "AUTH_OK" so the phone can proceed to send
+// WRITE_DATA <json>.
+//
+// We DON'T verify the signature here yet — the json hasn't been
+// transmitted, so we can't reconstruct the digest. The actual ECDSA
+// check happens in onWriteData when we have both halves.
+//
+// Format: AUTH <addr 0x+40hex> <pubkey 130hex> <sig 0x+130hex>
+void onWriteAuth(const String& line) {
+  s_pendingWriteAuth.valid = false;
+  if (!s_challengeValid) {
+    SerialBT.println("ERR no_challenge_issued");
+    return;
+  }
+  if (!OfflinePayWallet::hasOwner()) {
+    SerialBT.println("ERR no_owner_bonded");
+    return;
+  }
+  int sp1 = line.indexOf(' ');
+  int sp2 = line.indexOf(' ', sp1 + 1);
+  int sp3 = line.indexOf(' ', sp2 + 1);
+  if (sp1 < 0 || sp2 < 0 || sp3 < 0) {
+    SerialBT.println("ERR malformed_auth"); return;
+  }
+  String addrTok   = line.substring(sp1 + 1, sp2);
+  String pubkeyTok = line.substring(sp2 + 1, sp3);
+  String sigTok    = line.substring(sp3 + 1);
+
+  if (hexToBytes(addrTok.c_str(), addrTok.length(), s_pendingWriteAuth.addr20, 20) != 20) {
+    SerialBT.println("ERR bad_addr_hex"); return;
+  }
+  if (hexToBytes(pubkeyTok.c_str(), pubkeyTok.length(), s_pendingWriteAuth.pub65, 65) != 65 ||
+      s_pendingWriteAuth.pub65[0] != 0x04) {
+    SerialBT.println("ERR bad_pubkey_hex"); return;
+  }
+  if (hexToBytes(sigTok.c_str(), sigTok.length(), s_pendingWriteAuth.sig, 65) != 65) {
+    SerialBT.println("ERR bad_sig_hex"); return;
+  }
+
+  // Owner gate: only the bonded owner can request a card write.
+  uint8_t ownerStored[20];
+  if (!OfflinePayWallet::getOwner(ownerStored)) {
+    SerialBT.println("ERR no_owner_bonded"); return;
+  }
+  if (memcmp(s_pendingWriteAuth.addr20, ownerStored, 20) != 0) {
+    SerialBT.println("ERR not_owner"); return;
+  }
+
+  s_pendingWriteAuth.valid = true;
+  SerialBT.println("AUTH_OK");
+}
+
+// Step 2 of the two-step write: verify the stashed auth against the
+// JSON, then run the same write-mode loop the legacy onWrite uses.
+// Format: WRITE_DATA <json>
+void onWriteData(const String& line) {
+  if (!s_pendingWriteAuth.valid) {
+    SerialBT.println("ERR no_auth_pending");
+    return;
+  }
+  // line starts with "WRITE_DATA " (11 chars)
+  if (line.length() < 12) {
+    SerialBT.println("ERR empty_data"); return;
+  }
+  String jsonTok = line.substring(11);
+
+  uint8_t mac[6]; getBtMacBytes(mac);
+  uint8_t jsonHash[32];
+  keccak256_arduino((const uint8_t*)jsonTok.c_str(), jsonTok.length(), jsonHash);
+
+  size_t domLen = strlen(WRITE_DOMAIN);
+  size_t payloadLen = domLen + 6 + 16 + 32;
+  uint8_t payload[128];
+  memcpy(payload, WRITE_DOMAIN, domLen);
+  memcpy(payload + domLen, mac, 6);
+  memcpy(payload + domLen + 6, s_challenge, 16);
+  memcpy(payload + domLen + 6 + 16, jsonHash, 32);
+
+  bool ok = OfflinePayWallet::verifyEthPersonalSig(
+      payload, payloadLen,
+      s_pendingWriteAuth.pub65,
+      s_pendingWriteAuth.sig, s_pendingWriteAuth.sig + 32,
+      s_pendingWriteAuth.addr20);
+  if (!ok) {
+    s_pendingWriteAuth.valid = false;
+    SerialBT.println("ERR bad_signature");
+    return;
+  }
+  s_pendingWriteAuth.valid = false;
+  s_challengeValid = false;
+
+  // Same write-mode flow as onWrite from here on.
+  Mode prevMode = s_mode;
+  setMode(MODE_WRITE);
+  digitalWrite(LED_GREEN, HIGH);
+  Serial.print("[write] waiting up to ");
+  Serial.print(WRITE_WAIT_MS / 1000);
+  Serial.println("s for card…");
+
+  unsigned long start = millis();
+  bool gotCard = false;
+  while (millis() - start < WRITE_WAIT_MS) {
+    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+      gotCard = true; break;
+    }
+    pumpBtCommands();
+    delay(40);
+  }
+  if (!gotCard) {
+    digitalWrite(LED_GREEN, LOW);
+    setMode(prevMode);
+    SerialBT.println("ERR card_timeout");
+    return;
+  }
+
+  String uid = uidToHex(rfid.uid.uidByte, rfid.uid.size);
+  String wr = writeVoucher(jsonTok);
+  halt();
+  digitalWrite(LED_GREEN, LOW);
+  setMode(prevMode);
+
+  if (wr.length() == 0) {
+    tone(BUZZER, 1200, 120); delay(140);
+    tone(BUZZER, 1600, 160); delay(160);
+    noTone(BUZZER);
+    SerialBT.print("OK ");
+    SerialBT.println(uid);
+  } else {
+    flashRed("WRITE_FAIL");
+    SerialBT.print("ERR ");
+    SerialBT.println(wr);
+  }
+}
 
 void onWrite(const String& line) {
   if (!s_challengeValid) {
