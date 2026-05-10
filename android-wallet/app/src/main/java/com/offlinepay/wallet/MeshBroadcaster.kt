@@ -83,11 +83,18 @@ class MeshBroadcaster(
     /// SettledByPeer events when multiple peers broadcast settlement
     /// (e.g. relay + a backup that also tried).
     private val seenSettled: MutableSet<String> = ConcurrentHashMap.newKeySet()
-    /// voucherId → Voucher we still need to gossip. Drained as ACKs arrive
-    /// and as new peers connect. This is the durable retry queue that
-    /// papers over Nearby Connections' silent payload drops on flaky
-    /// channels (BLE-only handshake without a Wi-Fi/BT-classic upgrade).
-    private val pendingBroadcast = ConcurrentHashMap<String, Voucher>()
+    /// voucherId → (Voucher, optional Endorsement) bundle we still need
+    /// to gossip. Drained as ACKs arrive and as new peers connect. This
+    /// is the durable retry queue that papers over Nearby Connections'
+    /// silent payload drops on flaky channels (BLE-only handshake
+    /// without a Wi-Fi/BT-classic upgrade).
+    ///
+    /// The optional endorsement is what makes relay-settle work for
+    /// bearer cards: when a merchant phone is offline but a peer is
+    /// online, the peer can submit `settleBearerWithEndorsement` on
+    /// the merchant's behalf only if it has the endorsement bundle.
+    private data class PendingItem(val v: Voucher, val e: Endorsement?)
+    private val pendingBroadcast = ConcurrentHashMap<String, PendingItem>()
 
     private val _peerCountFlow = MutableStateFlow(0)
     /// Live peer count. Updated synchronously on every connect/disconnect so
@@ -134,6 +141,15 @@ class MeshBroadcaster(
         /// can deep-link straight to the explorer without ever needing
         /// internet itself.
         @SerialName("txHash") val txHash: String? = null,
+        /// Bearer-card endorsement, attached to `replica` messages when
+        /// the voucher is a true-bearer (recipient = 0x0). All four
+        /// fields are required as a set — the relay needs them to call
+        /// `settleBearerWithEndorsement`. Null for recipient-bound
+        /// vouchers (the legacy v3 path).
+        @SerialName("endTs")      val endorsementTs: Long?       = null,
+        @SerialName("endPrimary") val endorsementPrimary: String? = null,
+        @SerialName("endDevice")  val endorsementDevice: String?  = null,
+        @SerialName("endSig")     val endorsementSig: String?     = null,
     )
 
     /// Address of THIS device — placed in every outbound message so peers can
@@ -171,7 +187,7 @@ class MeshBroadcaster(
                 if (pendingBroadcast.isEmpty() || connected.isEmpty()) continue
                 val snapshot = pendingBroadcast.values.toList()
                 Log.i(TAG, "retry broadcast: ${snapshot.size} unacked voucher(s) → ${connected.size} endpoint(s)")
-                for (v in snapshot) sendReplicaTo(connected.toList(), v)
+                for (item in snapshot) sendReplicaTo(connected.toList(), item.v, item.e)
             }
         }
     }
@@ -187,13 +203,16 @@ class MeshBroadcaster(
 
     /// Broadcast a freshly-accepted voucher to every connected mesh peer.
     /// Each peer that stores it will reply with an ACK; replicaCount goes
-    /// up as ACKs come in.
-    fun broadcast(v: Voucher) {
+    /// up as ACKs come in. Pass `endorsement` when the voucher is a
+    /// bearer card — the endorsement bundle is what lets a relay peer
+    /// call `settleBearerWithEndorsement` on the merchant's behalf.
+    @JvmOverloads
+    fun broadcast(v: Voucher, endorsement: Endorsement? = null) {
         // Always queue. Even if no peer is connected right now, a peer
         // might come into range in seconds; the retry pump will deliver
         // it. If we already have an ACK, this is a no-op.
         if (ackedBy[v.voucherId]?.isNotEmpty() == true) return
-        pendingBroadcast[v.voucherId] = v
+        pendingBroadcast[v.voucherId] = PendingItem(v, endorsement)
 
         val targets = connected.toList()
         if (targets.isEmpty()) {
@@ -201,8 +220,10 @@ class MeshBroadcaster(
             _events.tryEmit(MeshEvent.VoucherBroadcast(v.voucherId, 0))
             return
         }
-        sendReplicaTo(targets, v)
-        Log.i(TAG, "broadcast voucher ${v.voucherId} → ${targets.size} endpoint(s); queued for retry until acked")
+        sendReplicaTo(targets, v, endorsement)
+        Log.i(TAG, "broadcast voucher ${v.voucherId} → ${targets.size} endpoint(s)" +
+                (if (endorsement != null) " [+endorsement]" else "") +
+                "; queued for retry until acked")
         _events.tryEmit(MeshEvent.VoucherBroadcast(v.voucherId, targets.size))
     }
 
@@ -226,7 +247,7 @@ class MeshBroadcaster(
         Log.i(TAG, "broadcastSettled ${voucherId.take(10)} tx=${txHash.take(10)} → ${connected.size} endpoint(s)")
     }
 
-    private fun sendReplicaTo(endpoints: List<String>, v: Voucher) {
+    private fun sendReplicaTo(endpoints: List<String>, v: Voucher, e: Endorsement? = null) {
         val msg = MeshMessage(
             type = "replica",
             voucherId = v.voucherId,
@@ -234,9 +255,14 @@ class MeshBroadcaster(
                 voucherId = v.voucherId, payer = v.payer,
                 merchant = v.merchant, recipient = v.recipient,
                 amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
-                signature = v.signature
+                signature = v.signature,
+                cardUid = v.cardUid,
             ),
             fromAddress = selfAddress,
+            endorsementTs      = e?.timestamp,
+            endorsementPrimary = e?.merchantPrimary,
+            endorsementDevice  = e?.deviceAddress,
+            endorsementSig     = e?.signature,
         )
         val payload = Payload.fromBytes(json.encodeToString(msg).toByteArray())
         for (endpointId in endpoints) {
@@ -284,7 +310,7 @@ class MeshBroadcaster(
                 val pending = pendingBroadcast.values.toList()
                 if (pending.isNotEmpty()) {
                     Log.i(TAG, "draining ${pending.size} pending voucher(s) to fresh peer $endpointId")
-                    for (v in pending) sendReplicaTo(listOf(endpointId), v)
+                    for (item in pending) sendReplicaTo(listOf(endpointId), item.v, item.e)
                 }
             }
         }
@@ -350,6 +376,20 @@ class MeshBroadcaster(
             "replica" -> {
                 val p = msg.payload ?: return
                 val v = Voucher.fromCardPayload(p)
+                // Reconstruct the endorsement bundle if the sender
+                // attached one. Bearer cards (recipient = 0x0) need
+                // it for relay-settle to work; for recipient-bound
+                // vouchers all four fields are null and we ignore.
+                val endorsement: Endorsement? =
+                    if (msg.endorsementSig != null && msg.endorsementPrimary != null &&
+                        msg.endorsementDevice != null && msg.endorsementTs != null)
+                        Endorsement(
+                            timestamp        = msg.endorsementTs,
+                            merchantPrimary  = msg.endorsementPrimary,
+                            deviceAddress    = msg.endorsementDevice,
+                            signature        = msg.endorsementSig,
+                        )
+                    else null
                 // Verify signature/expiry before storing — never trust a peer.
                 // ALREADY_SEEN is fine: ack it so the sender knows we already
                 // hold the backup and counts us as a replica.
@@ -357,8 +397,9 @@ class MeshBroadcaster(
                 val storeIt = verdict == VerifyResult.VALID
                 val ackIt   = storeIt || verdict == VerifyResult.ALREADY_SEEN
                 if (storeIt) {
-                    store.saveReplica(v)
-                    Log.i(TAG, "stored replica ${v.voucherId} from $endpointId")
+                    store.saveReplica(v, endorsement)
+                    Log.i(TAG, "stored replica ${v.voucherId} from $endpointId" +
+                            (if (endorsement != null) " [+endorsement]" else ""))
                     _events.tryEmit(MeshEvent.ReplicaStored(v.voucherId, endpointId))
                 }
                 if (ackIt) {

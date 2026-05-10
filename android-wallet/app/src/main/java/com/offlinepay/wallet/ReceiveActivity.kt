@@ -239,9 +239,10 @@ class ReceiveActivity : ComponentActivity() {
         if (result == VerifyResult.VALID) {
             store.saveAccepted(v, endorsement)
             activity.recordReceived(v.voucherId, v.payer, v.amount.toLong())
-            // Gossip to mesh peers so a third (online) device can relay-settle
-            // even if both sender and receiver stay offline. No-op if no peers.
-            WalletMesh.broadcast(v)
+            // Gossip to mesh peers — endorsement included so a relay
+            // peer can call settleBearerWithEndorsement on our behalf
+            // when we're offline.
+            WalletMesh.broadcast(v, endorsement)
             btBridge?.sendDecision(true)
             val amt = "%.2f".format(v.amount.toDouble() / 1e6)
             state.value = state.value.copy(

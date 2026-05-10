@@ -208,13 +208,18 @@ open class VoucherStore(ctx: Context) : VoucherStoreLike {
     suspend fun markRejected(id: String, reason: String) = dao.markRejected(id, reason)
     fun recent(): Flow<List<VoucherRow>> = dao.recent()
 
-    suspend fun saveReplica(v: Voucher) {
+    suspend fun saveReplica(v: Voucher, endorsement: Endorsement? = null) {
         dao.insert(VoucherRow(
             voucherId = v.voucherId, payer = v.payer, merchant = v.merchant, recipient = v.recipient,
             amount = v.amount.toString(), expiry = v.expiry, nonce = v.nonce,
             signature = v.signature,
             status = "replica", rejectReason = null,
             acceptedAtMs = System.currentTimeMillis(), settledTx = null,
+            cardUid = v.cardUid,
+            endorsementTs       = endorsement?.timestamp,
+            endorsementPrimary  = endorsement?.merchantPrimary,
+            endorsementDevice   = endorsement?.deviceAddress,
+            endorsementSig      = endorsement?.signature,
         ))
     }
 

@@ -88,12 +88,13 @@ object WalletMesh {
     /// Broadcast a voucher to all currently-connected mesh peers. Caller
     /// is responsible for having acquire()d already (we call mesh.broadcast
     /// directly which is a no-op if no peers are connected).
-    fun broadcast(v: Voucher) {
+    @JvmOverloads
+    fun broadcast(v: Voucher, endorsement: Endorsement? = null) {
         if (!initialized) {
             Log.w(TAG, "broadcast called before init; dropping ${v.voucherId.take(10)}")
             return
         }
-        mesh.broadcast(v)
+        mesh.broadcast(v, endorsement)
     }
 
     /// Tell every connected peer that this voucher just settled on chain.

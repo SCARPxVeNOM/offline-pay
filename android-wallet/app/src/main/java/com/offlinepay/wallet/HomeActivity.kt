@@ -126,8 +126,22 @@ class HomeActivity : ComponentActivity() {
                             merchant = row.merchant, recipient = row.recipient,
                             amount = BigInteger(row.amount),
                             expiry = row.expiry, nonce = row.nonce, signature = row.signature,
+                            cardUid = row.cardUid,
                         )
-                        WalletMesh.broadcast(v)
+                        // Re-broadcast bearer rows with their endorsement
+                        // so a relay peer can call settleBearerWithEndorsement
+                        // even if we're offline. Recipient-bound rows have
+                        // null endorsement fields → no-op.
+                        val endorsement = if (
+                            row.endorsementSig != null && row.endorsementPrimary != null &&
+                            row.endorsementDevice != null && row.endorsementTs != null
+                        ) Endorsement(
+                            timestamp        = row.endorsementTs,
+                            merchantPrimary  = row.endorsementPrimary,
+                            deviceAddress    = row.endorsementDevice,
+                            signature        = row.endorsementSig,
+                        ) else null
+                        WalletMesh.broadcast(v, endorsement)
                     }
                 }
                 val replicaIds = rows.filter { it.status == "replica" }.map { it.voucherId }.toSet()
