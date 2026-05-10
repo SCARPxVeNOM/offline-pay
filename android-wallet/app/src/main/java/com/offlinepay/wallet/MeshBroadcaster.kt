@@ -161,19 +161,8 @@ class MeshBroadcaster(
     val peerCount: Int get() = connected.size
 
     fun start() {
-        val opts = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        client.startAdvertising(deviceId, Config.MESH_SERVICE_ID, lifecycle, opts)
-            .addOnFailureListener {
-                Log.w(TAG, "advertise failed: $it")
-                _events.tryEmit(MeshEvent.AdvertiseFailed(it.message ?: it.javaClass.simpleName))
-            }
-
-        val dopts = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        client.startDiscovery(Config.MESH_SERVICE_ID, discovery, dopts)
-            .addOnFailureListener {
-                Log.w(TAG, "discover failed: $it")
-                _events.tryEmit(MeshEvent.DiscoverFailed(it.message ?: it.javaClass.simpleName))
-            }
+        startAdvertise()
+        startDiscover()
 
         // Retry pump. Without it, a payload that silently fails on the
         // initial broadcast (Nearby's payload upgrade fails on a thin
@@ -190,6 +179,42 @@ class MeshBroadcaster(
                 for (item in snapshot) sendReplicaTo(connected.toList(), item.v, item.e)
             }
         }
+
+        // Discovery rescan loop. Nearby Connections P2P_CLUSTER is
+        // asymmetric — phone A may find B before B finds A, leading to
+        // a topology where phone A claims 2 peers while B + C only see
+        // 1 each. Periodically restarting discovery (without touching
+        // advertise or existing connections) re-broadcasts our scan
+        // window so peers we missed at boot have another chance to
+        // be found. 25-second cadence is a balance: short enough to
+        // recover quickly, long enough not to thrash the BLE radio.
+        scope.launch {
+            while (true) {
+                delay(25_000)
+                Log.d(TAG, "rescan: restarting discovery (peers=${connected.size})")
+                runCatching { client.stopDiscovery() }
+                delay(500)  // brief pause so the stop fully unwinds before restart
+                startDiscover()
+            }
+        }
+    }
+
+    private fun startAdvertise() {
+        val opts = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        client.startAdvertising(deviceId, Config.MESH_SERVICE_ID, lifecycle, opts)
+            .addOnFailureListener {
+                Log.w(TAG, "advertise failed: $it")
+                _events.tryEmit(MeshEvent.AdvertiseFailed(it.message ?: it.javaClass.simpleName))
+            }
+    }
+
+    private fun startDiscover() {
+        val dopts = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        client.startDiscovery(Config.MESH_SERVICE_ID, discovery, dopts)
+            .addOnFailureListener {
+                Log.w(TAG, "discover failed: $it")
+                _events.tryEmit(MeshEvent.DiscoverFailed(it.message ?: it.javaClass.simpleName))
+            }
     }
 
     fun stop() {
@@ -274,8 +299,18 @@ class MeshBroadcaster(
 
     private val discovery = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
+            // Skip if we already have this endpoint — saves a guaranteed
+            // STATUS_ALREADY_CONNECTED failure log on every rescan tick.
+            if (connected.contains(endpointId)) return
             client.requestConnection(deviceId, endpointId, lifecycle)
-                .addOnFailureListener { Log.w(TAG, "request $endpointId failed: $it") }
+                .addOnFailureListener {
+                    val msg = it.message ?: it.javaClass.simpleName
+                    // 8003 = ALREADY_CONNECTED is benign (rescan re-finds
+                    // a peer we're already linked to). Quiet log so it
+                    // doesn't drown out real failures.
+                    if (msg.contains("8003")) Log.v(TAG, "request $endpointId already connected (ok)")
+                    else                      Log.w(TAG, "request $endpointId failed: $msg")
+                }
         }
         override fun onEndpointLost(endpointId: String) {
             if (connected.remove(endpointId)) {
