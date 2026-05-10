@@ -175,6 +175,18 @@ void setup() {
   showReady();
 }
 
+// Per-UID dedup: a MIFARE card sitting on the reader gets re-detected
+// by `PICC_IsNewCardPresent` every loop iteration after a halt(). If we
+// re-enter the read flow each time, we starve BT command processing,
+// spam serial, AND drop incoming BT bytes (the ESP-IDF rx buffer is
+// finite). Track the last processed UID; the same card sitting in the
+// field is silently ignored until it physically leaves and a different
+// card / no card is seen, which clears `s_lastUid`.
+//
+// Declared here (above setMode) so the function body can reference it
+// — Arduino IDE auto-forwards function decls but not static globals.
+static String s_lastUid = "";
+
 static void setMode(Mode m) {
   if (s_mode == m) return;
   Serial.print("[mode] "); Serial.print(modeName(s_mode));
@@ -188,15 +200,6 @@ static void setMode(Mode m) {
     rfid.PCD_StopCrypto1();
   }
 }
-
-// Per-UID dedup: a MIFARE card sitting on the reader gets re-detected
-// by `PICC_IsNewCardPresent` every loop iteration after a halt(). If we
-// re-enter the read flow each time, we starve BT command processing,
-// spam serial, AND drop incoming BT bytes (the ESP-IDF rx buffer is
-// finite). Track the last processed UID; the same card sitting in the
-// field is silently ignored until it physically leaves and a different
-// card / no card is seen, which clears `s_lastUid`.
-static String s_lastUid = "";
 
 // Sleep that keeps draining BT while it waits. UI helpers (flashRed,
 // flashGreen) used to call delay() directly which let the BT rx buffer
