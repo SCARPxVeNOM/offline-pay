@@ -54,6 +54,22 @@ static const uint64_t CHAIN_ID_VAL = 80002;  // Polygon Amoy
 // digest computation in onWrite/loop doesn't re-hash on every tap.
 static uint8_t s_endorseDomainHash[32];
 
+// Operating mode. Default = IDLE so a freshly-booted reader doesn't
+// hammer the RC522 with continuous detection cycles (which steals BT
+// CPU + drops bytes during phone WRITE handshakes). Phone explicitly
+// asks for READ mode when it's on the Receive screen, and the WRITE
+// handler temporarily flips into WRITE mode and back.
+enum Mode { MODE_IDLE = 0, MODE_READ = 1, MODE_WRITE = 2 };
+static volatile Mode s_mode = MODE_IDLE;
+static const char* modeName(Mode m) {
+  switch (m) {
+    case MODE_IDLE:  return "IDLE";
+    case MODE_READ:  return "READ";
+    case MODE_WRITE: return "WRITE";
+  }
+  return "?";
+}
+
 MFRC522 rfid(SS_PIN, RST_PIN);
 BluetoothSerial SerialBT;
 
@@ -151,8 +167,26 @@ void setup() {
   // 32-byte field in the endorsement digest preimage on every card read.
   keccak256_arduino((const uint8_t*)ENDORSE_DOMAIN, strlen(ENDORSE_DOMAIN), s_endorseDomainHash);
 
-  Serial.println("[RC522] reader ready, waiting for card...");
+  // Boot in IDLE so we don't hammer the RC522 before any phone needs
+  // us to. Phone explicitly transitions us to READ when the user
+  // opens the Receive screen.
+  s_mode = MODE_IDLE;
+  Serial.println("[mode] booted in IDLE — phone will request READ when needed");
   showReady();
+}
+
+static void setMode(Mode m) {
+  if (s_mode == m) return;
+  Serial.print("[mode] "); Serial.print(modeName(s_mode));
+  Serial.print(" -> ");    Serial.println(modeName(m));
+  s_mode = m;
+  // Whenever we leave a mode, drop any half-detected card so the next
+  // mode starts with a clean slate.
+  s_lastUid = "";
+  if (m != MODE_READ) {
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
 }
 
 // Per-UID dedup: a MIFARE card sitting on the reader gets re-detected
@@ -177,10 +211,18 @@ static void btSleep(unsigned long ms) {
 }
 
 void loop() {
-  // Drain any pending BT commands first — pairing / status / future
-  // WRITE/WIPE flow. Card detection happens after, so a phone asking
-  // for a challenge doesn't have to wait for a card tap.
+  // Drain any pending BT commands first — pairing / WRITE / mode
+  // transitions. Card detection happens only when we're explicitly
+  // in READ mode; otherwise the loop is BT-only so a phone WRITE
+  // handshake never competes with RC522 SPI for CPU.
   pumpBtCommands();
+
+  if (s_mode != MODE_READ) {
+    // IDLE or WRITE mode: card detection is handled elsewhere (or not
+    // at all). Just keep the BT pump cycling.
+    btSleep(20);
+    return;
+  }
 
   if (!rfid.PICC_IsNewCardPresent()) {
     // No card in field — reset dedup so a card returning later is
@@ -471,6 +513,16 @@ void handleBtLine(const String& line) {
   } else if (line == "WIPE_OWNER") {
     OfflinePayWallet::clearOwner();
     SerialBT.println("OK ok");
+  } else if (line == "MODE READ") {
+    setMode(MODE_READ);
+    SerialBT.println("OK mode=READ");
+  } else if (line == "MODE IDLE") {
+    setMode(MODE_IDLE);
+    SerialBT.println("OK mode=IDLE");
+  } else if (line == "MODE WRITE") {
+    // Optional explicit transition; WRITE handler also flips on its own.
+    setMode(MODE_WRITE);
+    SerialBT.println("OK mode=WRITE");
   }
   // ACCEPT/REJECT for the voucher-decision flow are still consumed by the
   // existing waitForDecision() inside the card-tap path — they arrive
@@ -660,10 +712,11 @@ void onWrite(const String& line) {
   }
   s_challengeValid = false;
 
-  // Wait for a card and write the JSON. Visual cue: solid green.
-  // Reset dedup so a card already on the reader (which the loop
-  // recently skipped) can be picked up here.
-  s_lastUid = "";
+  // We've authenticated the WRITE request. Take exclusive control of
+  // the reader for up to WRITE_WAIT_MS — main loop's read flow stays
+  // out of the way, BT pump still runs (no SPI competing for cycles).
+  Mode prevMode = s_mode;
+  setMode(MODE_WRITE);
   digitalWrite(LED_GREEN, HIGH);
   Serial.print("[write] waiting up to ");
   Serial.print(WRITE_WAIT_MS / 1000);
@@ -675,10 +728,12 @@ void onWrite(const String& line) {
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
       gotCard = true; break;
     }
+    pumpBtCommands();   // keep BT alive during the card-tap wait
     delay(40);
   }
   if (!gotCard) {
     digitalWrite(LED_GREEN, LOW);
+    setMode(prevMode);
     SerialBT.println("ERR card_timeout");
     return;
   }
@@ -687,6 +742,7 @@ void onWrite(const String& line) {
   String wr = writeVoucher(jsonTok);
   halt();
   digitalWrite(LED_GREEN, LOW);
+  setMode(prevMode);
 
   if (wr.length() == 0) {
     tone(BUZZER, 1200, 120); delay(140);

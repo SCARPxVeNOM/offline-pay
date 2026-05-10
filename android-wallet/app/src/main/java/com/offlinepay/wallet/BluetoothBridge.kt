@@ -77,6 +77,16 @@ class BluetoothBridge(
                 output = socket!!.outputStream
                 Log.d(TAG, "connected to $deviceName")
 
+                // Tell the firmware we're ready for card reads. Without
+                // this it stays in IDLE and won't process card taps —
+                // the new mode-aware firmware boots in IDLE so it
+                // doesn't hammer the RC522 by default.
+                runCatching {
+                    output?.write("MODE READ\n".toByteArray())
+                    output?.flush()
+                    Log.d(TAG, "sent MODE READ")
+                }
+
                 val reader = BufferedReader(InputStreamReader(socket!!.inputStream))
                 runReadLoop(reader)
             } catch (e: Exception) {
@@ -144,7 +154,17 @@ class BluetoothBridge(
         catch (e: Exception) { Log.e(TAG, "decision write failed: ${e.message}") }
     }
 
-    fun close() { try { socket?.close() } catch (_: Exception) {} }
+    fun close() {
+        // Tell the firmware to stop hammering RFID before we tear the
+        // socket down. Best-effort — if the write fails the firmware
+        // will detect the closed socket on its next pump.
+        runCatching {
+            output?.write("MODE IDLE\n".toByteArray())
+            output?.flush()
+            Log.d(TAG, "sent MODE IDLE")
+        }
+        try { socket?.close() } catch (_: Exception) {}
+    }
 
     private fun parseVoucherFrame(trimmed: String): Voucher? {
         // Reader prints either:
