@@ -214,6 +214,28 @@ class SettlementClient(
             null
         }
 
+    /// USDC wallet balance — `IERC20.balanceOf(addr)` against the
+    /// configured USDC contract. Receivers see their wallet grow here
+    /// when their bearer/recipient-bound vouchers settle on chain;
+    /// senders see this stay flat (their locked funds are inside the
+    /// vault, not the USDC wallet, until they `unlock` them).
+    suspend fun usdcBalance(addr: String): BigInteger = withContext(Dispatchers.IO) {
+        val function = Function(
+            "balanceOf",
+            listOf(Address(addr)),
+            listOf<TypeReference<*>>(object : TypeReference<Uint256>() {})
+        )
+        val data = FunctionEncoder.encode(function)
+        val resp = web3.ethCall(
+            org.web3j.protocol.core.methods.request.Transaction.createEthCallTransaction(
+                fromAddress, Config.USDC_ADDRESS, data
+            ),
+            org.web3j.protocol.core.DefaultBlockParameterName.LATEST
+        ).send()
+        if (resp.hasError()) BigInteger.ZERO
+        else BigInteger(resp.value.removePrefix("0x").ifEmpty { "0" }, 16)
+    }
+
     suspend fun maticBalance(addr: String): BigInteger = withContext(Dispatchers.IO) {
         web3.ethGetBalance(addr, org.web3j.protocol.core.DefaultBlockParameterName.LATEST).send().balance
     }

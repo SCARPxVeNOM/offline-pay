@@ -246,8 +246,15 @@ class HomeActivity : ComponentActivity() {
         if (!isOnline()) return
         homeScope.launch {
             runCatching {
+                // Pull both: lockedBalance (vault deposits, sender side)
+                // and usdc.balanceOf (received payments, receiver side).
+                // Receivers never accumulate in lockedBalance; senders'
+                // received payments DO appear here too if they ever get
+                // paid. Either way we want both.
                 val locked = settle.lockedBalance(keyVault.address)
+                val usdc   = settle.usdcBalance(keyVault.address)
                 balanceCache.lockedBalance = locked
+                balanceCache.usdcBalance   = usdc
                 balanceCache.lastSyncedMs = System.currentTimeMillis()
                 // Look up sent voucherIds we've recorded but never confirmed
                 // as settled. Limit to the most recent 50 so we don't blast
@@ -271,19 +278,26 @@ class HomeActivity : ComponentActivity() {
     private fun renderBalance() {
         homeScope.launch {
             val locked = balanceCache.lockedBalance
+            val usdc   = balanceCache.usdcBalance
             val sentRows = VoucherDb.get(this@HomeActivity).activityDao().recentList()
             val sentVouchers = sentRows.filter { it.kind == "sent" && it.voucherId != null }.take(50)
             val inFlight = sentVouchers
                 .filter { !balanceCache.isSettled(it.voucherId!!) }
                 .sumOf { it.amountBaseUnits }
             val lockedLong = locked.toLong()
+            val usdcLong   = usdc.toLong()
+            // SPENDABLE = locked − inFlight (offline voucher capacity).
+            // ON CHAIN  = locked + usdc (total wealth on the contract).
+            // For receivers without a topup, locked = 0 but usdc grows
+            // with every settled voucher → ON CHAIN climbs in real time.
             val spendableLong = (lockedLong - inFlight).coerceAtLeast(0L)
+            val onChainLong   = lockedLong + usdcLong
             val syncedAgo = balanceCache.lastSyncedMs.let { ts ->
                 if (ts == 0L) null
                 else ((System.currentTimeMillis() - ts) / 1000).toInt().coerceAtLeast(0)
             }
             state.value = state.value.copy(
-                lockedUsdc    = "%.2f".format(lockedLong / 1e6),
+                lockedUsdc    = "%.2f".format(onChainLong / 1e6),
                 inFlightUsdc  = "%.2f".format(inFlight / 1e6),
                 spendableUsdc = "%.2f".format(spendableLong / 1e6),
                 syncedSecondsAgo = syncedAgo,

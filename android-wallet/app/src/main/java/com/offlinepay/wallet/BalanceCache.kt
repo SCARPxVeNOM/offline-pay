@@ -19,11 +19,21 @@ class BalanceCache(ctx: Context) {
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     /// Last on-chain `lockedBalance(self)` we observed, in USDC base
-    /// units. Seeded to 0 if never synced.
+    /// units. Seeded to 0 if never synced. This is funds locked into
+    /// the vault for voucher signing — only senders accumulate this.
     var lockedBalance: BigInteger
         get() = prefs.getString(KEY_LOCKED, null)?.let { runCatching { BigInteger(it) }.getOrNull() }
             ?: BigInteger.ZERO
         set(v) { prefs.edit().putString(KEY_LOCKED, v.toString()).apply() }
+
+    /// Last on-chain `usdc.balanceOf(self)` we observed. Receivers
+    /// accumulate USDC here when their bearer/recipient-bound vouchers
+    /// settle on chain — so a merchant's "ON CHAIN" figure goes up
+    /// when they get paid, even though their `lockedBalance` is zero.
+    var usdcBalance: BigInteger
+        get() = prefs.getString(KEY_USDC, null)?.let { runCatching { BigInteger(it) }.getOrNull() }
+            ?: BigInteger.ZERO
+        set(v) { prefs.edit().putString(KEY_USDC, v.toString()).apply() }
 
     /// Wall-clock millis at which lockedBalance was last refreshed from
     /// chain. UI converts this to "synced Xm ago" so the user knows
@@ -62,6 +72,7 @@ class BalanceCache(ctx: Context) {
     companion object {
         private const val PREFS = "offpay_balance_cache"
         private const val KEY_LOCKED = "lockedBalance"
+        private const val KEY_USDC = "usdcBalance"
         private const val KEY_SYNC_TS = "lastSyncedMs"
         private const val KEY_SETTLED = "settledVoucherIds"
     }

@@ -302,6 +302,25 @@ class MeshBroadcaster(
             // Skip if we already have this endpoint — saves a guaranteed
             // STATUS_ALREADY_CONNECTED failure log on every rescan tick.
             if (connected.contains(endpointId)) return
+
+            // Deterministic tie-break: only the phone with the lower
+            // wallet address initiates the connection; the other one
+            // waits for the incoming request. Without this, when both
+            // phones discover each other simultaneously they BOTH call
+            // requestConnection → Nearby gets confused and neither side
+            // completes, leaving one (or both) stuck without the link.
+            //
+            // Both sides of the comparison are the device's `deviceId`
+            // (= wallet address, set when we called startAdvertising).
+            // Symmetric across all peers, total order, no coordination.
+            val mine = deviceId.lowercase()
+            val theirs = info.endpointName.lowercase()
+            if (mine >= theirs) {
+                Log.d(TAG, "endpoint $endpointId (theirs=$theirs) found — passive side, " +
+                        "waiting for them to initiate")
+                return
+            }
+            Log.d(TAG, "endpoint $endpointId (theirs=$theirs) found — initiating connection")
             client.requestConnection(deviceId, endpointId, lifecycle)
                 .addOnFailureListener {
                     val msg = it.message ?: it.javaClass.simpleName
