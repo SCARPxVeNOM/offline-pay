@@ -6,7 +6,7 @@
 
 **Tap. Settle later. Even when nobody has internet.**
 
-USDC payments where the customer is offline, the merchant is offline,
+MockUSDC payments where the customer is offline, the merchant is offline,
 and the chain isn't even nearby — yet the money still moves
 deterministically when *anyone* in the room has bandwidth.
 
@@ -62,7 +62,7 @@ recipient's address. A relay node — any third phone with internet —
 broadcasts `settleBearerBatch(...)` and pays the gas. Because the recipient
 is bound at signing time, the relay literally cannot redirect funds to
 itself. The vault checks the signature, decrements `lockedBalance[payer]`,
-transfers USDC to `voucher.recipient`. Done.
+transfers MockUSDC to `voucher.recipient`. Done.
 
 ### 3. For physical bearer cards, the merchant binds at tap time
 
@@ -216,7 +216,7 @@ This is the hardest scenario we proved end-to-end:
       - voucher sig recovers to Nothing (the payer)
       - endorsement sig recovers to ESP32's wallet
       - merchantPrimary committed inside endorsement = OnePlus
-    USDC transferred: vault → OnePlus
+    MockUSDC transferred: vault → OnePlus
     Samsung emits "settled" over the mesh.
 
 4. EVERYONE'S BALANCE UPDATES
@@ -274,7 +274,7 @@ they just paid the gas.
 
 These are real on-chain settlements from the v3.1 vault. Each one is a
 voucher that started as bytes on a MIFARE card or an NFC tap and ended as
-a USDC transfer to the recipient's wallet:
+a MockUSDC transfer to the recipient's wallet:
 
 - [`0x00dc3a8120080b42eec8ad3e65650011c56ebd5de7bedcae8864bf99a7b67a3c`](https://amoy.polygonscan.com/tx/0x00dc3a8120080b42eec8ad3e65650011c56ebd5de7bedcae8864bf99a7b67a3c)
 - [`0x49fb051c07c558d87562b261a21812de3d3c5b6cbdef475c89e82ec83d127ea1`](https://amoy.polygonscan.com/tx/0x49fb051c07c558d87562b261a21812de3d3c5b6cbdef475c89e82ec83d127ea1)
