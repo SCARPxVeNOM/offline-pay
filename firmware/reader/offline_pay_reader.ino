@@ -151,10 +151,15 @@ void setup() {
   pinMode(LED_RED,   OUTPUT);
   pinMode(BUZZER,    OUTPUT);
 
+  // Bump the SPP RX buffer BEFORE begin(). Default is 256 bytes — way
+  // too small for the 627-byte WRITE command that the phone sends in a
+  // single write. Without this the tail of WRITE is silently dropped at
+  // the BT controller level and our pump never sees a complete \n line.
+  SerialBT.setRxBufferSize(4096);
   if (!SerialBT.begin("OfflinePay_Reader")) {
     Serial.println("[BT] init failed");
   } else {
-    Serial.println("[BT] OfflinePay_Reader online");
+    Serial.println("[BT] OfflinePay_Reader online (rx buf 4096)");
   }
 
   // Provision (or load) this device's secp256k1 wallet. Address must be
