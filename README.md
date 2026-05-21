@@ -6,6 +6,8 @@
 
 **Tap. Settle later. Even when nobody has internet.**
 
+**SUBMISSION LINK-> https://devfolio.co/projects/offpay-03c3 **
+
 MockUSDC payments where the customer is offline, the merchant is offline,
 and the chain isn't even nearby — yet the money still moves
 deterministically when *anyone* in the room has bandwidth.
