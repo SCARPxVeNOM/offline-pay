@@ -18,6 +18,33 @@ Polygon Amoy testnet · Solidity contracts · Android (Jetpack Compose) · ESP32
 
 ---
 
+## Demo
+
+https://github.com/user-attachments/assets/offpay-demo.mp4
+
+https://github.com/SCARPxVeNOM/offline-pay/raw/main/docs/img/offpay-demo.mp4
+
+---
+
+## Screenshots
+
+<div align="center">
+<table>
+<tr>
+<td align="center"><strong>Home Screen</strong></td>
+<td align="center"><strong>QR & Transactions</strong></td>
+<td align="center"><strong>Activity History</strong></td>
+</tr>
+<tr>
+<td><img src="docs/img/homescreen.jpg" alt="OFFPAY Home Screen" width="250"/></td>
+<td><img src="docs/img/qr-transactions.jpg" alt="QR Code & Transactions" width="250"/></td>
+<td><img src="docs/img/activity-history.jpg" alt="All Activity History" width="250"/></td>
+</tr>
+</table>
+</div>
+
+---
+
 ## The problem we're solving
 
 In the streets we live in — chai stalls, ration shops, auto rickshaws —
