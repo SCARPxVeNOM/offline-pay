@@ -20,13 +20,7 @@ Polygon Amoy testnet · Solidity contracts · Android (Jetpack Compose) · ESP32
 
 ## Demo
 
-<div align="center">
-
-[![Watch OFFPAY Demo](docs/img/homescreen.jpg)](https://github.com/SCARPxVeNOM/offline-pay/raw/main/docs/img/offpay-demo.mp4)
-
-**Click the image above to watch the demo video**
-
-</div>
+https://github.com/SCARPxVeNOM/offline-pay/raw/main/docs/img/offpay-demo.mp4
 
 ---
 
